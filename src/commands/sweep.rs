@@ -1,5 +1,5 @@
 use crate::cli::SweepArgs;
-use crate::client::JenkinsClient;
+use crate::client::{encode_job_path, JenkinsClient};
 use crate::commands::build::parse_params;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -100,9 +100,8 @@ async fn trigger_and_resolve(
     params: &[(String, String)],
     poll_ms: u64,
 ) -> Result<u64> {
-    let encoded = job.replace(' ', "%20");
     let resp = client
-        .post(&format!("job/{encoded}/buildWithParameters"))
+        .post(&format!("job/{}/buildWithParameters", encode_job_path(job)))
         .await?
         .form(params)
         .send()
@@ -154,10 +153,9 @@ async fn wait_for_completion(
     build: u64,
     poll_ms: u64,
 ) -> Result<Option<String>> {
-    let encoded = job.replace(' ', "%20");
     loop {
         let resp = client
-            .get(&format!("job/{encoded}/{build}/api/json?tree=building,result"))
+            .get(&format!("job/{}/{build}/api/json?tree=building,result", encode_job_path(job)))
             .await
             .context("polling build status")?;
 
@@ -174,9 +172,8 @@ async fn wait_for_completion(
 // ── Step 3: fetch the complete console log and write to disk ─────────────────
 
 async fn save_log(client: &JenkinsClient, job: &str, build: u64, path: &Path) -> Result<()> {
-    let encoded = job.replace(' ', "%20");
     let resp = client
-        .get(&format!("job/{encoded}/{build}/consoleText"))
+        .get(&format!("job/{}/{build}/consoleText", encode_job_path(job)))
         .await
         .context("fetching console log")?;
 

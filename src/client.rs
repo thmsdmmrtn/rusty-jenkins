@@ -47,6 +47,23 @@ impl JenkinsClient {
     fn url(&self, path: &str) -> String {
         format!("{}/{}", self.base_url, path.trim_start_matches('/'))
     }
+}
+
+/// Convert a slash-separated Jenkins job path into the nested `job/` URL form
+/// that the Jenkins REST API requires for folders.
+///
+/// "folder/subfolder/jobname" → "folder/job/subfolder/job/jobname"
+/// Prepend "job/" when building the final path:
+///   format!("job/{}/api/json", encode_job_path(name))
+pub fn encode_job_path(job: &str) -> String {
+    job.split('/')
+        .map(|seg| seg.replace(' ', "%20"))
+        .collect::<Vec<_>>()
+        .join("/job/")
+}
+
+// Re-open impl block so the rest of the file is unchanged.
+impl JenkinsClient {
 
     // ── Public HTTP helpers ───────────────────────────────────────────────────
 
@@ -113,6 +130,33 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── encode_job_path ───────────────────────────────────────────────────────
+
+    #[test]
+    fn encode_job_path_plain_job_is_unchanged() {
+        assert_eq!(encode_job_path("my-job"), "my-job");
+    }
+
+    #[test]
+    fn encode_job_path_single_folder() {
+        assert_eq!(encode_job_path("folder/my-job"), "folder/job/my-job");
+    }
+
+    #[test]
+    fn encode_job_path_deep_nesting() {
+        assert_eq!(
+            encode_job_path("CONTROLLER/NAME/OF/OTHER/STUFF/jobname"),
+            "CONTROLLER/job/NAME/job/OF/job/OTHER/job/STUFF/job/jobname"
+        );
+    }
+
+    #[test]
+    fn encode_job_path_encodes_spaces_in_each_segment() {
+        assert_eq!(encode_job_path("my folder/my job"), "my%20folder/job/my%20job");
+    }
+
+    // ── HTTP tests ────────────────────────────────────────────────────────────
 
     const USER: &str = "thomas";
     const TOKEN: &str = "test-token";

@@ -1,5 +1,5 @@
 use crate::cli::{ConfigAction, ConfigArgs, ConfigGetArgs, ConfigSetArgs};
-use crate::client::JenkinsClient;
+use crate::client::{encode_job_path, JenkinsClient};
 use anyhow::{Context, Result};
 
 // ── Command dispatcher ────────────────────────────────────────────────────────
@@ -14,8 +14,7 @@ pub async fn run(client: &JenkinsClient, args: &ConfigArgs) -> Result<()> {
 // ── config get ────────────────────────────────────────────────────────────────
 
 async fn get(client: &JenkinsClient, args: &ConfigGetArgs) -> Result<()> {
-    let encoded = args.job.replace(' ', "%20");
-    let resp = client.get(&format!("job/{encoded}/config.xml")).await?;
+    let resp = client.get(&format!("job/{}/config.xml", encode_job_path(&args.job))).await?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -33,9 +32,8 @@ async fn set(client: &JenkinsClient, args: &ConfigSetArgs) -> Result<()> {
     let xml = std::fs::read_to_string(&args.file)
         .with_context(|| format!("reading local file '{}'", args.file))?;
 
-    let encoded = args.job.replace(' ', "%20");
     let resp = client
-        .post(&format!("job/{encoded}/config.xml"))
+        .post(&format!("job/{}/config.xml", encode_job_path(&args.job)))
         .await?
         .header("Content-Type", "application/xml")
         .body(xml)

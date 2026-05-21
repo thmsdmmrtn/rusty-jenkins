@@ -1,5 +1,5 @@
 use crate::cli::LogsArgs;
-use crate::client::JenkinsClient;
+use crate::client::{encode_job_path, JenkinsClient};
 use anyhow::{Context, Result};
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
@@ -52,9 +52,8 @@ pub async fn run(client: &JenkinsClient, args: &LogsArgs) -> Result<()> {
 }
 
 async fn resolve_latest(client: &JenkinsClient, job: &str) -> Result<u64> {
-    let encoded = job.replace(' ', "%20");
     let resp = client
-        .get(&format!("job/{encoded}/api/json"))
+        .get(&format!("job/{}/api/json", encode_job_path(job)))
         .await?;
 
     let status = resp.status();
@@ -70,8 +69,7 @@ async fn resolve_latest(client: &JenkinsClient, job: &str) -> Result<u64> {
 }
 
 async fn stream(client: &JenkinsClient, job: &str, build: u64, poll_ms: u64) -> Result<()> {
-    let encoded = job.replace(' ', "%20");
-    let base = format!("job/{encoded}/{build}/logText/progressiveText");
+    let base = format!("job/{}/{build}/logText/progressiveText", encode_job_path(job));
     let mut start: u64 = 0;
 
     loop {

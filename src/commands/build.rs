@@ -1,5 +1,5 @@
 use crate::cli::BuildArgs;
-use crate::client::JenkinsClient;
+use crate::client::{encode_job_path, JenkinsClient};
 use anyhow::{Context, Result};
 
 // ── Parameter parsing ─────────────────────────────────────────────────────────
@@ -21,7 +21,7 @@ pub fn parse_params(raw: &[String]) -> Result<Vec<(String, String)>> {
 // ── Command entry point ───────────────────────────────────────────────────────
 
 pub async fn run(client: &JenkinsClient, args: &BuildArgs) -> Result<()> {
-    let encoded = args.job.replace(' ', "%20");
+    let encoded = encode_job_path(&args.job);
 
     let (path, pairs) = if args.params.is_empty() {
         (format!("job/{encoded}/build"), vec![])

@@ -34,18 +34,33 @@ cargo build --release
 
 ### Build — Windows
 
-Windows lacks a built-in C linker. The easiest option is [Strawberry Perl](https://strawberryperl.com), which ships MinGW-W64. After installing it, add its `bin` directory to your PATH and build with the GNU target:
+Windows lacks a built-in C linker. The steps below use [Strawberry Perl](https://strawberryperl.com), which ships MinGW-W64.
+
+**One-time setup:**
 
 ```powershell
-# Add Strawberry Perl's MinGW to PATH (adjust drive letter if needed)
-$env:Path = "C:\Strawberry\c\bin;$env:Path"
-
+# 1. Install the GNU Rust toolchain and make it the default
 rustup toolchain install stable-x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu
-# binary at: target\x86_64-pc-windows-gnu\release\rj.exe
+rustup default stable-x86_64-pc-windows-gnu
+
+# 2. Add Strawberry Perl's MinGW to your permanent PATH, then restart the terminal
+[System.Environment]::SetEnvironmentVariable(
+    "Path",
+    "C:\Strawberry\c\bin;" + [System.Environment]::GetEnvironmentVariable("Path", "User"),
+    "User"
+)
 ```
 
-Alternatively, install [Visual Studio Build Tools](https://aka.ms/vs/17/release/vs_BuildTools.exe) with the **Desktop development with C++** workload, then `cargo build --release` with no extra flags.
+**Build:**
+
+```powershell
+cargo build --release
+# binary at: target\release\rj.exe
+```
+
+> **Why `rustup default`?** Passing `--target x86_64-pc-windows-gnu` only changes the output target, not the active toolchain. Build scripts (proc-macro2, serde, etc.) still compile with the default toolchain — which on a fresh Rust install is MSVC — and MSVC needs `link.exe`. Making GNU the *default* ensures everything uses the GNU linker.
+
+Alternatively, install [Visual Studio Build Tools](https://aka.ms/vs/17/release/vs_BuildTools.exe) with the **Desktop development with C++** workload, then `cargo build --release` with no extra setup.
 
 ---
 
@@ -74,6 +89,40 @@ rj --url http://jenkins.local:8080 --user alice --token <token> inspect my-job
 ```
 
 Generate an API token in Jenkins under **User → Configure → API Token**.
+
+### Folders and nested jobs
+
+All commands accept a `/`-separated path as the job name. `rj` translates it
+into the nested `job/` URL structure the Jenkins REST API requires:
+
+```
+"folder/subfolder/my-job"
+        ↓
+job/folder/job/subfolder/job/my-job/...
+```
+
+### CloudBees CI / controllers with a URL prefix
+
+CloudBees CI controllers sit under a path prefix (e.g. `/app-shared-controller`).
+Set `JENKINS_URL` to everything **up to and including that prefix** — stop at
+the first `/job/` segment — then pass the folder path as the job name:
+
+```bash
+# Base URL includes the controller prefix
+export JENKINS_URL="https://ci.example.com/controller-name"
+
+# Job name is the slash-separated folder path (no leading /job/)
+rj inspect "folder-name/subfolder-name/my-job"
+```
+
+`rj` constructs the full URL automatically:
+
+```
+https://ci.example.com/controller-name/job/folder-name/job/subfolder-name/job/my-job/api/json
+```
+
+The CSRF crumb, build triggers, log streaming, and config endpoints all follow
+the same pattern and require no extra configuration.
 
 ---
 
@@ -282,7 +331,7 @@ src/
 cargo test
 ```
 
-74 tests across all modules, covering:
+78 tests across all modules, covering:
 
 - CLI argument parsing including shell-array-style multi-value flags (unit)
 - Basic Auth header attachment (wiremock)
@@ -292,3 +341,4 @@ cargo test
 - Log streaming: `X-Text-Size` offset advancement and `X-More-Data` loop control (wiremock + unit)
 - `config.xml` GET and POST with `Content-Type: application/xml` verification (wiremock)
 - Sweep: queue item polling, build-complete polling, log file writing, full end-to-end loop (wiremock + unit)
+- Folder/nested job path encoding: plain jobs, single folder, deep nesting, spaces in segment names (unit)

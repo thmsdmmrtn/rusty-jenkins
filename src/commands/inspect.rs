@@ -1,5 +1,5 @@
 use crate::cli::InspectArgs;
-use crate::client::JenkinsClient;
+use crate::client::{encode_job_path, JenkinsClient};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -76,8 +76,7 @@ const TREE: &str = "name,description,buildable,\
 
 pub async fn run(client: &JenkinsClient, args: &InspectArgs) -> Result<()> {
     // Spaces in job names need encoding; nested jobs use job/folder/job/name.
-    let encoded = args.job.replace(' ', "%20");
-    let path = format!("job/{encoded}/api/json?tree={TREE}");
+    let path = format!("job/{}/api/json?tree={TREE}", encode_job_path(&args.job));
 
     let resp = client.get(&path).await?;
     let status = resp.status();
