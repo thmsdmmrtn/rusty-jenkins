@@ -57,12 +57,26 @@ pub fn list_cookie_names(jenkins_url: &str, browser: &str, profile: &str) -> Res
         }
         println!("  • The cookie may have expired — log in again and retry");
     } else {
+        let auth: Vec<&str> = names.iter()
+            .filter(|n| n.starts_with("JSESSIONID"))
+            .map(String::as_str)
+            .collect();
+
         println!("Found {} cookie(s):", names.len());
         for name in &names {
-            println!("  {name}");
+            if name.starts_with("JSESSIONID") {
+                println!("  {name}  ← auth");
+            } else {
+                println!("  {name}  (preference, ignored)");
+            }
         }
         println!();
-        println!("To use these cookies, run with --from-{browser}");
+        if auth.is_empty() {
+            println!("No JSESSIONID cookies found — you may not be logged in.");
+        } else {
+            println!("rj will use: {}", auth.join(", "));
+            println!("Run with --from-{browser} to authenticate.");
+        }
     }
 
     Ok(())
@@ -183,8 +197,12 @@ fn query_firefox_cookies(db_path: &Path, hostname: &str) -> Result<String> {
     let now_unix = unix_now_secs() as i64;
     let mut stmt = conn
         .prepare(
+            // Only JSESSIONID* cookies are used for Jenkins auth.
+            // Other cookies (timestamper, screenResolution, etc.) are preferences only.
             "SELECT name, value FROM moz_cookies
-              WHERE (host = ?1 OR host = ?2) AND expiry > ?3
+              WHERE (host = ?1 OR host = ?2)
+                AND expiry > ?3
+                AND name LIKE 'JSESSIONID%'
               ORDER BY name",
         )
         .context("preparing Firefox cookie query")?;
@@ -336,9 +354,11 @@ fn query_chrome_cookies(db_path: &Path, hostname: &str, master_key: &[u8]) -> Re
 
     let mut stmt = conn
         .prepare(
+            // Only JSESSIONID* cookies are used for Jenkins auth.
             "SELECT name, value, encrypted_value FROM cookies
               WHERE (host_key = ?1 OR host_key = ?2)
                 AND (expires_utc = 0 OR expires_utc > ?3)
+                AND name LIKE 'JSESSIONID%'
               ORDER BY name",
         )
         .context("preparing Chrome cookie query")?;

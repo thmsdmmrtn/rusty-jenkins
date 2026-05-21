@@ -46,7 +46,7 @@ pub struct Cli {
     pub list_cookies: bool,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -239,7 +239,7 @@ mod tests {
     fn inspect_parses_job_name() {
         let cli = parse(&["inspect", "deploy-prod"]);
         match cli.command {
-            Command::Inspect(args) => assert_eq!(args.job, "deploy-prod"),
+            Some(Command::Inspect(args)) => assert_eq!(args.job, "deploy-prod"),
             _ => panic!("expected Inspect variant"),
         }
     }
@@ -250,7 +250,7 @@ mod tests {
     fn build_parses_job_with_no_params() {
         let cli = parse(&["build", "nightly-tests"]);
         match cli.command {
-            Command::Build(args) => {
+            Some(Command::Build(args)) => {
                 assert_eq!(args.job, "nightly-tests");
                 assert!(args.params.is_empty());
             }
@@ -262,7 +262,7 @@ mod tests {
     fn build_parses_multiple_params() {
         let cli = parse(&["build", "deploy", "-p", "ENV=staging", "-p", "VERSION=1.2.3"]);
         match cli.command {
-            Command::Build(args) => {
+            Some(Command::Build(args)) => {
                 assert_eq!(args.job, "deploy");
                 assert_eq!(args.params, vec!["ENV=staging", "VERSION=1.2.3"]);
             }
@@ -276,7 +276,7 @@ mod tests {
     fn logs_defaults_to_latest_build() {
         let cli = parse(&["logs", "my-job"]);
         match cli.command {
-            Command::Logs(args) => {
+            Some(Command::Logs(args)) => {
                 assert_eq!(args.job, "my-job");
                 assert_eq!(args.build, None);
                 assert_eq!(args.poll_ms, 1000);
@@ -289,7 +289,7 @@ mod tests {
     fn logs_accepts_explicit_build_number_and_poll_interval() {
         let cli = parse(&["logs", "my-job", "--build", "42", "--poll-ms", "500"]);
         match cli.command {
-            Command::Logs(args) => {
+            Some(Command::Logs(args)) => {
                 assert_eq!(args.build, Some(42));
                 assert_eq!(args.poll_ms, 500);
             }
@@ -303,7 +303,7 @@ mod tests {
     fn config_get_parses_job_name() {
         let cli = parse(&["config", "get", "my-job"]);
         match cli.command {
-            Command::Config(cfg) => match cfg.action {
+            Some(Command::Config(cfg)) => match cfg.action {
                 ConfigAction::Get(args) => assert_eq!(args.job, "my-job"),
                 _ => panic!("expected Get variant"),
             },
@@ -315,7 +315,7 @@ mod tests {
     fn config_set_parses_job_and_file() {
         let cli = parse(&["config", "set", "my-job", "/tmp/config.xml"]);
         match cli.command {
-            Command::Config(cfg) => match cfg.action {
+            Some(Command::Config(cfg)) => match cfg.action {
                 ConfigAction::Set(args) => {
                     assert_eq!(args.job, "my-job");
                     assert_eq!(args.file, "/tmp/config.xml");
@@ -334,7 +334,7 @@ mod tests {
         let cli = parse(&["sweep", "my-job", "--param-name", "ENV",
                           "--value", "staging", "--value", "prod"]);
         match cli.command {
-            Command::Sweep(args) => assert_eq!(args.values, vec!["staging", "prod"]),
+            Some(Command::Sweep(args)) => assert_eq!(args.values, vec!["staging", "prod"]),
             _ => panic!("expected Sweep variant"),
         }
     }
@@ -346,7 +346,7 @@ mod tests {
                           "--value", "bar", "baz", "bam",
                           "-p", "VERSION=1.0"]);
         match cli.command {
-            Command::Sweep(args) => {
+            Some(Command::Sweep(args)) => {
                 assert_eq!(args.values, vec!["bar", "baz", "bam"]);
                 assert_eq!(args.params, vec!["VERSION=1.0"]);
             }
@@ -358,7 +358,7 @@ mod tests {
     fn sweep_defaults() {
         let cli = parse(&["sweep", "my-job", "--param-name", "ENV", "--value", "x"]);
         match cli.command {
-            Command::Sweep(args) => {
+            Some(Command::Sweep(args)) => {
                 assert_eq!(args.output_dir, "sweep-logs");
                 assert_eq!(args.poll_ms, 2000);
                 assert!(args.params.is_empty());

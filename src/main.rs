@@ -7,6 +7,7 @@ mod client;
 mod commands;
 
 use cli::{Cli, Command};
+use clap::CommandFactory;
 use client::JenkinsClient;
 
 #[tokio::main]
@@ -45,11 +46,18 @@ async fn run() -> Result<()> {
     };
 
     match &cli.command {
-        Command::Inspect(args) => commands::inspect::run(&client, args).await,
-        Command::Build(args)   => commands::build::run(&client, args).await,
-        Command::Logs(args)    => commands::logs::run(&client, args).await,
-        Command::Config(args)  => commands::config::run(&client, args).await,
-        Command::Sweep(args)   => commands::sweep::run(&client, args).await,
-        Command::List(args)    => commands::list::run(&client, args).await,
+        Some(Command::Inspect(args)) => commands::inspect::run(&client, args).await,
+        Some(Command::Build(args))   => commands::build::run(&client, args).await,
+        Some(Command::Logs(args))    => commands::logs::run(&client, args).await,
+        Some(Command::Config(args))  => commands::config::run(&client, args).await,
+        Some(Command::Sweep(args))   => commands::sweep::run(&client, args).await,
+        Some(Command::List(args))    => commands::list::run(&client, args).await,
+        None => {
+            // No subcommand and --list-cookies was already handled above.
+            // Print help so the user knows what's available.
+            Cli::command().print_help()?;
+            println!();
+            Ok(())
+        }
     }
 }
