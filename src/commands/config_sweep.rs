@@ -163,8 +163,13 @@ async fn fetch_config(client: &JenkinsClient, job: &str) -> Result<String> {
 }
 
 /// Trigger a branch scan (indexing run) on the parent pipeline and wait for
-/// it to finish. This is necessary after a repo config change so Jenkins
-/// re-discovers branches in the new repository before we attempt a branch build.
+/// it to finish. This re-discovers branches in the new repository so Jenkins
+/// accepts a branch build request without returning HTTP 400.
+///
+/// CloudBees CI and some Jenkins versions handle indexing synchronously and
+/// return 200 with no Location header instead of queuing the scan. We handle
+/// both cases: queue-based (poll to completion) and fire-and-forget (poll the
+/// indexing sub-resource directly).
 async fn run_scan(client: &JenkinsClient, parent_job: &str, poll_ms: u64) -> Result<()> {
     let resp = client
         .post(&format!("job/{}/build", encode_job_path(parent_job)))
@@ -179,17 +184,61 @@ async fn run_scan(client: &JenkinsClient, parent_job: &str, poll_ms: u64) -> Res
         anyhow::bail!("scan trigger returned HTTP {status}");
     }
 
-    let location = resp
-        .headers()
-        .get("Location")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("no Location header in scan response"))?
-        .to_string();
+    // Case 1: Jenkins queued the scan — poll it to completion via the queue.
+    if let Some(loc) = resp.headers().get("Location").and_then(|v| v.to_str().ok()) {
+        if let Ok(queue_id) = extract_queue_id(loc) {
+            if let Ok(scan_build) = poll_queue(client, queue_id, poll_ms).await {
+                wait_for_completion(client, parent_job, scan_build, poll_ms).await?;
+                return Ok(());
+            }
+        }
+    }
 
-    let queue_id = extract_queue_id(&location)?;
-    let scan_build = poll_queue(client, queue_id, poll_ms).await?;
-    wait_for_completion(client, parent_job, scan_build, poll_ms).await?;
-    Ok(())
+    // Case 2: No Location header — CloudBees CI / some Jenkins versions start
+    // indexing synchronously. Poll the pipeline's indexing sub-resource until
+    // it reports not-building, then give it a short extra settling delay.
+    poll_indexing(client, parent_job, poll_ms).await
+}
+
+/// Poll `GET /job/<pipeline>/indexing/api/json` until building == false.
+/// Falls back gracefully if the endpoint doesn't exist (older Jenkins).
+async fn poll_indexing(client: &JenkinsClient, parent_job: &str, poll_ms: u64) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct IndexingStatus {
+        building: Option<bool>,
+    }
+
+    let path = format!("job/{}/indexing/api/json?tree=building", encode_job_path(parent_job));
+    let effective_poll = poll_ms.max(1000); // at least 1 s between polls
+
+    loop {
+        let resp = client.get(&path).await?;
+
+        // 404 means this Jenkins version doesn't expose the indexing sub-resource.
+        // Just return — the scan was triggered, we can't track it further.
+        if resp.status() == 404 {
+            // Give the scan a fixed settling time before the caller proceeds.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            return Ok(());
+        }
+
+        if !resp.status().is_success() {
+            // Non-fatal — proceed with the branch build anyway.
+            return Ok(());
+        }
+
+        let status: IndexingStatus = match resp.json().await {
+            Ok(s) => s,
+            Err(_) => return Ok(()), // can't parse; proceed
+        };
+
+        match status.building {
+            Some(false) | None => return Ok(()),
+            Some(true) => {
+                tokio::time::sleep(std::time::Duration::from_millis(effective_poll)).await;
+            }
+        }
+    }
 }
 
 async fn upload_config(client: &JenkinsClient, job: &str, xml: &str) -> Result<()> {
