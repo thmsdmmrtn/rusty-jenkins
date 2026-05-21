@@ -124,7 +124,7 @@ async fn trigger_and_resolve(
     poll_queue(client, queue_id, poll_ms).await
 }
 
-async fn poll_queue(client: &JenkinsClient, queue_id: u64, poll_ms: u64) -> Result<u64> {
+pub async fn poll_queue(client: &JenkinsClient, queue_id: u64, poll_ms: u64) -> Result<u64> {
     loop {
         let resp = client
             .get(&format!("queue/item/{queue_id}/api/json"))
@@ -147,7 +147,7 @@ async fn poll_queue(client: &JenkinsClient, queue_id: u64, poll_ms: u64) -> Resu
 
 // ── Step 2: poll build until it finishes ─────────────────────────────────────
 
-async fn wait_for_completion(
+pub async fn wait_for_completion(
     client: &JenkinsClient,
     job: &str,
     build: u64,

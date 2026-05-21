@@ -68,6 +68,10 @@ pub enum Command {
 
     /// List the jobs and sub-folders inside a folder (or the root)
     List(ListArgs),
+
+    /// Patch an XML tag in a job's config, trigger a build for each value,
+    /// wait for completion, save the log, then restore the original config
+    ConfigSweep(ConfigSweepArgs),
 }
 
 // ── inspect ──────────────────────────────────────────────────────────────────
@@ -175,6 +179,35 @@ pub struct ListArgs {
     /// Folder path to list (slash-separated, e.g. "folder/subfolder").
     /// Omit to list the Jenkins root.
     pub path: Option<String>,
+}
+
+// ── config-sweep ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct ConfigSweepArgs {
+    /// Jenkins job name
+    pub job: String,
+
+    /// XML tag name whose text content should be changed for each run.
+    /// e.g. "repository" for Branch Sources → Repository Name
+    #[arg(long)]
+    pub xml_tag: String,
+
+    /// Values to iterate through — one build is triggered per value
+    #[arg(long = "value", short = 'v', num_args = 1..)]
+    pub values: Vec<String>,
+
+    /// Directory where per-build log files are written (created if absent)
+    #[arg(long, default_value = "config-sweep-logs")]
+    pub output_dir: String,
+
+    /// Polling interval in milliseconds (queue wait and build-complete wait)
+    #[arg(long, default_value_t = 2000)]
+    pub poll_ms: u64,
+
+    /// Skip restoring the original config.xml after the sweep completes
+    #[arg(long, default_value_t = false)]
+    pub no_restore: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

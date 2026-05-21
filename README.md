@@ -12,6 +12,7 @@ A modular, async Rust CLI for the Jenkins REST API.
 | `config get` | Download and print a job's `config.xml` |
 | `config set` | Upload a local `config.xml` to replace a job's configuration |
 | `sweep` | Run a job repeatedly, varying one parameter each time, and save each build's log |
+| `config-sweep` | Patch an XML tag in a job's config for each value, trigger a build, save the log, then restore |
 | `list` | List the jobs and sub-folders inside a folder (or the root) |
 
 All commands handle Basic Auth and Jenkins CSRF crumbs automatically.
@@ -67,34 +68,121 @@ Alternatively, install [Visual Studio Build Tools](https://aka.ms/vs/17/release/
 
 ## Configuration
 
-Credentials are read from environment variables, which means you never need to pass them as flags:
+### Basic Auth (username + API token)
 
-```powershell
-$env:JENKINS_URL   = "http://jenkins.example.com:8080"
-$env:JENKINS_USER  = "your-username"
-$env:JENKINS_TOKEN = "<your-api-token>"
+Credentials are read from environment variables:
+
+```bash
+export JENKINS_URL="http://jenkins.example.com:8080"
+export JENKINS_USER="your-username"
+export JENKINS_TOKEN="your-api-token"
 ```
 
-To make them permanent (survives reboots):
+To make them permanent on macOS/Linux, add those lines to your `~/.zshrc` or `~/.bashrc`. On Windows:
 
 ```powershell
 [System.Environment]::SetEnvironmentVariable("JENKINS_URL",   "http://jenkins.example.com:8080", "User")
-[System.Environment]::SetEnvironmentVariable("JENKINS_USER",  "your-username",            "User")
-[System.Environment]::SetEnvironmentVariable("JENKINS_TOKEN", "<your-api-token>",          "User")
+[System.Environment]::SetEnvironmentVariable("JENKINS_USER",  "your-username",                   "User")
+[System.Environment]::SetEnvironmentVariable("JENKINS_TOKEN", "your-api-token",                   "User")
 ```
 
 You can also pass them as flags on any command:
 
-```
+```bash
 rj --url http://jenkins.local:8080 --user alice --token <token> inspect my-job
 ```
 
 Generate an API token in Jenkins under **User → Configure → API Token**.
 
+---
+
+### SSO authentication (Okta, SAML, etc.)
+
+If your Jenkins is behind SSO, API tokens and passwords won't work — the login flow lives in the identity provider. `rj` can read session cookies directly from your browser after you log in normally.
+
+#### `--from-chrome` / `--from-firefox`
+
+Log into Jenkins in your browser via SSO, then pass the flag on any command:
+
+```bash
+rj --from-chrome list
+rj --from-chrome inspect folder/my-job
+rj --from-chrome sweep my-job --param-name ENV --value staging prod
+```
+
+`rj` reads your browser's cookie database, extracts all `JSESSIONID.*` cookies for the Jenkins hostname, and sends them as the `Cookie` header. All other cookies (preferences, analytics) are ignored.
+
+**Platform notes:**
+
+| Platform | Chrome | Firefox |
+|---|---|---|
+| macOS | Keychain → PBKDF2 → AES-128-CBC | Plaintext SQLite |
+| Windows | DPAPI → AES-256-GCM | Plaintext SQLite |
+
+On macOS, the first run of `--from-chrome` may show a Keychain permission prompt — click **Allow** (or **Always Allow** to skip it on future runs).
+
+#### Non-default Chrome profile
+
+If you use a work profile rather than the default Chrome profile, pass its folder name. Open `chrome://version` and look at **Profile Path** — the last folder name is what you need:
+
+```bash
+rj --from-chrome --chrome-profile "Profile 1" list
+```
+
+Common names: `Default`, `Profile 1`, `Profile 2`.
+
+#### Diagnosing cookie issues — `--list-cookies`
+
+Run without a subcommand to see which cookies are found for the Jenkins hostname:
+
+```bash
+rj --from-chrome --list-cookies
+rj --from-chrome --chrome-profile "Profile 1" --list-cookies
+rj --from-firefox --list-cookies
+```
+
+Example output:
+
+```
+Looking for cookies matching host: ci.example.com
+Found 9 cookie(s):
+  JSESSIONID.06393bc    ← auth
+  JSESSIONID.656c2ac9   ← auth
+  JSESSIONID.b12b9956   ← auth
+  javamelody.period     (preference, ignored)
+  jenkins-timestamper   (preference, ignored)
+  screenResolution      (preference, ignored)
+
+rj will use: JSESSIONID.06393bc, JSESSIONID.656c2ac9, JSESSIONID.b12b9956
+Run with --from-chrome to authenticate.
+```
+
+If no cookies are found: make sure you're logged in, check the profile name, and verify the session hasn't expired.
+
+#### Manual cookie (`--cookie` / `JENKINS_COOKIE`)
+
+Paste a cookie string directly — useful when `--from-chrome` can't decrypt or you want to reuse a known-good value from browser DevTools (**F12 → Application → Cookies**):
+
+```bash
+# Must be name=value format
+export JENKINS_COOKIE="JSESSIONID.06393bc=node0abc123def456.node0"
+rj list
+```
+
+**Authentication precedence** (highest wins):
+
+```
+JENKINS_COOKIE / --cookie
+    > --from-chrome
+        > --from-firefox
+            > JENKINS_TOKEN / Basic Auth
+```
+
+---
+
 ### Folders and nested jobs
 
-All commands accept a `/`-separated path as the job name. `rj` translates it
-into the nested `job/` URL structure the Jenkins REST API requires:
+All commands accept a `/`-separated path as the job name. `rj` translates it into the nested `job/` URL structure the Jenkins REST API requires:
 
 ```
 "folder/subfolder/my-job"
@@ -104,15 +192,11 @@ job/folder/job/subfolder/job/my-job/...
 
 ### CloudBees CI / controllers with a URL prefix
 
-CloudBees CI controllers sit under a path prefix (e.g. `/app-shared-controller`).
-Set `JENKINS_URL` to everything **up to and including that prefix** — stop at
-the first `/job/` segment — then pass the folder path as the job name:
+CloudBees CI controllers sit under a path prefix (e.g. `/app-shared-controller`). Set `JENKINS_URL` to everything **up to and including that prefix** — stop at the first `/job/` segment — then pass the folder path as the job name:
 
 ```bash
-# Base URL includes the controller prefix
 export JENKINS_URL="https://ci.example.com/controller-name"
 
-# Job name is the slash-separated folder path (no leading /job/)
 rj inspect "folder-name/subfolder-name/my-job"
 ```
 
@@ -122,16 +206,48 @@ rj inspect "folder-name/subfolder-name/my-job"
 https://ci.example.com/controller-name/job/folder-name/job/subfolder-name/job/my-job/api/json
 ```
 
-The CSRF crumb, build triggers, log streaming, and config endpoints all follow
-the same pattern and require no extra configuration.
-
 ---
 
 ## Usage
 
-### `inspect`
+### `list`
+
+List the jobs and sub-folders inside a folder. Use this to explore the job tree and validate that a folder path is correct before running other commands.
+
+```bash
+rj list                      # root
+rj list folder/subfolder     # specific folder
+```
+
+**Example output:**
 
 ```
+folder/subfolder/
+  [FOLDER]  another-folder
+  [JOB]     deploy-prod                          SUCCESS
+  [JOB]     nightly-tests                        FAILED
+  [JOB]     integration-suite                    NOT BUILT
+  [JOB]     hotfix-pipeline                      SUCCESS   *building*
+
+  1 folder(s), 4 job(s)
+```
+
+| Color | Status |
+|---|---|
+| `blue` | SUCCESS |
+| `red` | FAILED |
+| `yellow` | UNSTABLE |
+| `aborted` | ABORTED |
+| `disabled` | DISABLED |
+| *(absent / other)* | NOT BUILT |
+
+A `*building*` indicator appears next to any job currently running.
+
+---
+
+### `inspect`
+
+```bash
 rj inspect <job>
 ```
 
@@ -155,13 +271,13 @@ Parameters:
 
 Trigger a build with no parameters:
 
-```
+```bash
 rj build <job>
 ```
 
 Trigger a parameterized build (repeat `-p` for each parameter):
 
-```
+```bash
 rj build <job> -p KEY=VALUE -p OTHER=VALUE
 ```
 
@@ -179,19 +295,19 @@ Values containing `=` are handled correctly — the split always occurs on the *
 
 Stream the console log for the most recent build:
 
-```
+```bash
 rj logs <job>
 ```
 
 Stream a specific build number:
 
-```
+```bash
 rj logs <job> --build 42
 ```
 
 Control the polling interval (default 1000 ms):
 
-```
+```bash
 rj logs <job> --poll-ms 500
 ```
 
@@ -203,13 +319,13 @@ The loop polls `/logText/progressiveText`, advances the byte offset using `X-Tex
 
 Print the raw `config.xml` for a job:
 
-```
+```bash
 rj config get <job>
 ```
 
 Pipe it to a file to edit locally:
 
-```
+```bash
 rj config get my-job > my-job.xml
 ```
 
@@ -219,13 +335,13 @@ rj config get my-job > my-job.xml
 
 Upload a local `config.xml` to replace a job's configuration:
 
-```
+```bash
 rj config set <job> <file>
 ```
 
 Example workflow — download, edit, re-upload:
 
-```powershell
+```bash
 rj config get my-job > my-job.xml
 # edit my-job.xml
 rj config set my-job my-job.xml
@@ -298,43 +414,84 @@ Log files are named `{job}__{param}__{value}__#{build}.log`. A build failure or 
 
 ---
 
-### `list`
+### `config-sweep`
 
-List the jobs and sub-folders inside a folder. Use this to explore the job tree and validate that a folder path is correct before running other commands.
+Iterate over a list of values by patching an XML tag in the job's `config.xml` before each build. Useful when the variation lives in the job configuration rather than a build parameter — for example, changing **Branch Sources → Repository Name** in a Multibranch Pipeline.
 
 ```bash
-# List the Jenkins root
-rj list
-
-# List a specific folder (slash-separated path)
-rj list folder/subfolder
+rj config-sweep <job> \
+    --xml-tag <tag> \
+    --value <val1> <val2> <val3> \
+    [--output-dir <dir>] \
+    [--poll-ms <ms>] \
+    [--no-restore]
 ```
 
-**Example output:**
+**Finding the right tag name:**
 
-```
-folder/subfolder/
-  [FOLDER]  another-folder
-  [JOB]     deploy-prod                          SUCCESS
-  [JOB]     nightly-tests                        FAILED
-  [JOB]     integration-suite                    NOT BUILT
-  [JOB]     hotfix-pipeline                      SUCCESS   *building*
-
-  1 folder(s), 4 job(s)
+```bash
+# Inspect the XML first to find the field you want to change
+rj config get folder/my-job | grep -A2 -B2 repository
 ```
 
-Build status is derived from Jenkins' `color` field:
+For a GitHub Branch Source the tag is typically `<repository>`:
 
-| Color | Status |
-|---|---|
-| `blue` | SUCCESS |
-| `red` | FAILED |
-| `yellow` | UNSTABLE |
-| `aborted` | ABORTED |
-| `disabled` | DISABLED |
-| *(absent / other)* | NOT BUILT |
+```xml
+<source class="...GitHubSCMSource">
+  <repoOwner>my-org</repoOwner>
+  <repository>my-repo</repository>   ← --xml-tag repository
+```
 
-A `*building*` indicator appears next to any job currently running. Pointing `list` at a job path (rather than a folder) returns an empty result with a hint to use `rj inspect` instead.
+**Example:**
+
+```bash
+rj config-sweep folder/my-job \
+    --xml-tag repository \
+    --value repo-a repo-b repo-c \
+    --output-dir ./results \
+    --poll-ms 3000
+```
+
+**Console output:**
+
+```
+Fetching config.xml for 'folder/my-job'…
+
+[1/3] <repository> = repo-a
+  Config updated.
+  Queued as build #47
+  Result: SUCCESS
+  Log:    results/my-job__repository__repo-a__#47.log
+
+[2/3] <repository> = repo-b
+  Config updated.
+  Queued as build #48
+  Result: SUCCESS
+  Log:    results/my-job__repository__repo-b__#48.log
+
+[3/3] <repository> = repo-c
+  Config updated.
+  Queued as build #49
+  Result: FAILURE
+  Log:    results/my-job__repository__repo-c__#49.log
+
+Restoring original config.xml… done.
+Config sweep complete. Logs in 'results'.
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--xml-tag` | *(required)* | XML tag name to patch (first occurrence in the document) |
+| `--value` / `-v` | *(required)* | Values to iterate — space-separated or repeated flags |
+| `--output-dir` | `config-sweep-logs` | Directory for log files (created if absent) |
+| `--poll-ms` | `2000` | Polling interval for queue and build-complete checks |
+| `--no-restore` | | Skip restoring the original config after the sweep |
+
+The original `config.xml` is downloaded once, patched in memory for each iteration (only the target tag is changed), and restored when the sweep completes. Use `--no-restore` if you want the last value to remain.
+
+Log files follow the same naming as `sweep`: `{job}__{tag}__{value}__#{build}.log`.
 
 ---
 
@@ -345,12 +502,14 @@ src/
 ├── main.rs              # #[tokio::main] entry point — parses CLI, builds client, dispatches
 ├── cli.rs               # clap derive structs for all commands and subcommands
 ├── client.rs            # JenkinsClient — Basic Auth, CSRF crumb fetch & cache
+├── browser.rs           # Firefox/Chrome cookie extraction for SSO auth
 └── commands/
     ├── inspect.rs       # Job/parameter JSON deserialisation and display
     ├── build.rs         # Plain and parameterized POST build trigger
     ├── logs.rs          # Async progressive-text polling loop
     ├── config.rs        # XML config GET and POST
-    ├── sweep.rs         # Multi-build loop: queue polling, build-wait, log saving
+    ├── config_sweep.rs  # XML-patch loop: patch config, build, wait, save log, restore
+    ├── sweep.rs         # Build-param loop: queue polling, build-wait, log saving
     └── list.rs          # Folder contents listing with status and building indicator
 ```
 
@@ -363,17 +522,21 @@ src/
 | `reqwest` | HTTP client with JSON and form support |
 | `serde` / `serde_json` | JSON deserialisation |
 | `anyhow` | Ergonomic error propagation with context chains |
+| `rusqlite` (bundled) | Read Firefox/Chrome cookie databases |
+| `xmltree` | In-memory XML patching for `config-sweep` |
+| `aes-gcm` | AES-256-GCM decryption for Chrome cookies (Windows) |
+| `cbc` / `pbkdf2` / `sha1` *(macOS)* | AES-128-CBC + key derivation for Chrome cookies (macOS) |
 | `wiremock` *(dev)* | Mock HTTP server for integration tests |
 
 ---
 
 ## Testing
 
-```powershell
+```bash
 cargo test
 ```
 
-90 tests across all modules, covering:
+107 tests across all modules, covering:
 
 - CLI argument parsing including shell-array-style multi-value flags (unit)
 - Basic Auth header attachment (wiremock)
@@ -385,3 +548,5 @@ cargo test
 - Sweep: queue item polling, build-complete polling, log file writing, full end-to-end loop (wiremock + unit)
 - Folder/nested job path encoding: plain jobs, single folder, deep nesting, spaces in segment names (unit)
 - Folder listing: color-to-status mapping, `_anime` building detection, folder vs job class detection, root vs nested path routing (wiremock + unit)
+- Browser cookie extraction: hostname parsing, Firefox profile discovery, Chrome AES-GCM/CBC roundtrip decryption (unit)
+- Config sweep: XML tag patching (including deeply nested and first-occurrence logic), full build loop with config restore (wiremock + unit)
