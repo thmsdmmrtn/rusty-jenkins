@@ -36,6 +36,9 @@ pub enum Command {
 
     /// Run a job repeatedly, varying one parameter each time, and save each build's log
     Sweep(SweepArgs),
+
+    /// List the jobs and sub-folders inside a folder (or the root)
+    List(ListArgs),
 }
 
 // ── inspect ──────────────────────────────────────────────────────────────────
@@ -134,6 +137,15 @@ pub struct SweepArgs {
     /// Polling interval in milliseconds (queue wait and build-complete wait)
     #[arg(long, default_value_t = 2000)]
     pub poll_ms: u64,
+}
+
+// ── list ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Folder path to list (slash-separated, e.g. "folder/subfolder").
+    /// Omit to list the Jenkins root.
+    pub path: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

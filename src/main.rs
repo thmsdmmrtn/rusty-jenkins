@@ -27,5 +27,6 @@ async fn run() -> Result<()> {
         Command::Logs(args)    => commands::logs::run(&client, args).await,
         Command::Config(args)  => commands::config::run(&client, args).await,
         Command::Sweep(args)   => commands::sweep::run(&client, args).await,
+        Command::List(args)    => commands::list::run(&client, args).await,
     }
 }

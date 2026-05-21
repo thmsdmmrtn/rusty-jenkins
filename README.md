@@ -12,6 +12,7 @@ A modular, async Rust CLI for the Jenkins REST API.
 | `config get` | Download and print a job's `config.xml` |
 | `config set` | Upload a local `config.xml` to replace a job's configuration |
 | `sweep` | Run a job repeatedly, varying one parameter each time, and save each build's log |
+| `list` | List the jobs and sub-folders inside a folder (or the root) |
 
 All commands handle Basic Auth and Jenkins CSRF crumbs automatically.
 
@@ -297,6 +298,46 @@ Log files are named `{job}__{param}__{value}__#{build}.log`. A build failure or 
 
 ---
 
+### `list`
+
+List the jobs and sub-folders inside a folder. Use this to explore the job tree and validate that a folder path is correct before running other commands.
+
+```bash
+# List the Jenkins root
+rj list
+
+# List a specific folder (slash-separated path)
+rj list folder/subfolder
+```
+
+**Example output:**
+
+```
+folder/subfolder/
+  [FOLDER]  another-folder
+  [JOB]     deploy-prod                          SUCCESS
+  [JOB]     nightly-tests                        FAILED
+  [JOB]     integration-suite                    NOT BUILT
+  [JOB]     hotfix-pipeline                      SUCCESS   *building*
+
+  1 folder(s), 4 job(s)
+```
+
+Build status is derived from Jenkins' `color` field:
+
+| Color | Status |
+|---|---|
+| `blue` | SUCCESS |
+| `red` | FAILED |
+| `yellow` | UNSTABLE |
+| `aborted` | ABORTED |
+| `disabled` | DISABLED |
+| *(absent / other)* | NOT BUILT |
+
+A `*building*` indicator appears next to any job currently running. Pointing `list` at a job path (rather than a folder) returns an empty result with a hint to use `rj inspect` instead.
+
+---
+
 ## Architecture
 
 ```
@@ -309,7 +350,8 @@ src/
     ├── build.rs         # Plain and parameterized POST build trigger
     ├── logs.rs          # Async progressive-text polling loop
     ├── config.rs        # XML config GET and POST
-    └── sweep.rs         # Multi-build loop: queue polling, build-wait, log saving
+    ├── sweep.rs         # Multi-build loop: queue polling, build-wait, log saving
+    └── list.rs          # Folder contents listing with status and building indicator
 ```
 
 **Key dependencies:**
@@ -331,7 +373,7 @@ src/
 cargo test
 ```
 
-78 tests across all modules, covering:
+90 tests across all modules, covering:
 
 - CLI argument parsing including shell-array-style multi-value flags (unit)
 - Basic Auth header attachment (wiremock)
@@ -342,3 +384,4 @@ cargo test
 - `config.xml` GET and POST with `Content-Type: application/xml` verification (wiremock)
 - Sweep: queue item polling, build-complete polling, log file writing, full end-to-end loop (wiremock + unit)
 - Folder/nested job path encoding: plain jobs, single folder, deep nesting, spaces in segment names (unit)
+- Folder listing: color-to-status mapping, `_anime` building detection, folder vs job class detection, root vs nested path routing (wiremock + unit)
