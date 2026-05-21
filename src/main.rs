@@ -21,13 +21,18 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // Resolve authentication: explicit cookie > --from-browser > Basic Auth
+    // Resolve authentication: explicit cookie > --from-chrome > --from-firefox > Basic Auth
     let client = if let Some(cookie) = &cli.cookie {
         JenkinsClient::new_with_cookie(&cli.url, cookie)
-    } else if cli.from_browser {
+    } else if cli.from_chrome {
+        let cookie = browser::chrome_cookies(&cli.url)
+            .context("reading session cookies from Chrome")?;
+        eprintln!("Using Chrome session cookies for authentication.");
+        JenkinsClient::new_with_cookie(&cli.url, cookie)
+    } else if cli.from_firefox {
         let cookie = browser::firefox_cookies(&cli.url)
             .context("reading session cookies from Firefox")?;
-        println!("Using Firefox session cookies for authentication.");
+        eprintln!("Using Firefox session cookies for authentication.");
         JenkinsClient::new_with_cookie(&cli.url, cookie)
     } else {
         JenkinsClient::new(&cli.url, &cli.user, &cli.token)

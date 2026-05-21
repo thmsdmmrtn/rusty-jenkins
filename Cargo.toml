@@ -8,14 +8,24 @@ name = "rj"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0"
-rusqlite = { version = "0.31", features = ["bundled"] }
-clap = { version = "4", features = ["derive", "env"] }
-reqwest = { version = "0.12", features = ["json", "multipart"] }
-serde = { version = "1", features = ["derive"] }
+aes-gcm    = "0.10"
+anyhow     = "1.0"
+base64     = "0.22"
+clap       = { version = "4", features = ["derive", "env"] }
+reqwest    = { version = "0.12", features = ["json", "multipart"] }
+rusqlite   = { version = "0.31", features = ["bundled"] }
+serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+tokio      = { version = "1", features = ["full"] }
+
+# macOS Chrome uses AES-128-CBC + PBKDF2-HMAC-SHA1 instead of Windows AES-256-GCM + DPAPI
+[target.'cfg(target_os = "macos")'.dependencies]
+aes    = "0.8"
+cbc    = { version = "0.1", features = ["std"] }
+hmac   = "0.12"
+pbkdf2 = "0.12"
+sha1   = { version = "0.10", features = ["oid"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
-wiremock = "0.6"
+wiremock   = "0.6"

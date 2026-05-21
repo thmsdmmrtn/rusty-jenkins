@@ -1,41 +1,48 @@
-//! Read session cookies from the Firefox cookie database.
+//! Read session cookies from Firefox or Chrome.
 //!
-//! After logging into Jenkins via SSO in Firefox, this module extracts the
+//! After logging into Jenkins via SSO in a browser, this module extracts the
 //! relevant cookies so `rj` can authenticate API requests without Basic Auth.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── Public entry points ───────────────────────────────────────────────────────
 
-/// Return a `Cookie: …` header value built from every non-expired session
-/// cookie Firefox holds for the Jenkins hostname.
+/// Return a `Cookie: …` header value from the Firefox cookie database.
 pub fn firefox_cookies(jenkins_url: &str) -> Result<String> {
     let hostname = extract_hostname(jenkins_url)?;
-    let db_path = find_cookie_db()?;
-    read_cookies(&db_path, &hostname)
+    let db = find_firefox_cookie_db()?;
+    query_firefox_cookies(&db, &hostname)
+}
+
+/// Return a `Cookie: …` header value from the Chrome cookie database.
+pub fn chrome_cookies(jenkins_url: &str) -> Result<String> {
+    let hostname = extract_hostname(jenkins_url)?;
+    let db = find_chrome_cookie_db()?;
+    let key = chrome_master_key()?;
+    query_chrome_cookies(&db, &hostname, &key)
 }
 
 // ── Hostname extraction ───────────────────────────────────────────────────────
 
-/// Strip scheme, path, and port from a URL, leaving just the hostname.
-/// "https://ci.example.com:8080/controller" → "ci.example.com"
+/// Strip scheme, path, and port: "https://ci.example.com:8443/ctrl" → "ci.example.com"
 pub fn extract_hostname(url: &str) -> Result<String> {
     let without_scheme = url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
-
-    let host_and_port = without_scheme.split('/').next().unwrap_or(without_scheme);
-    let hostname = host_and_port.split(':').next().unwrap_or(host_and_port);
-
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let hostname = host_port.split(':').next().unwrap_or(host_port);
     if hostname.is_empty() {
         anyhow::bail!("could not extract hostname from URL: {url}");
     }
     Ok(hostname.to_string())
 }
 
-// ── Firefox profile discovery ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Firefox
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn firefox_base_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
@@ -45,7 +52,7 @@ fn firefox_base_dir() -> Result<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        let home = std::env::var("HOME").context("HOME env var not set")?;
+        let home = std::env::var("HOME").context("HOME not set")?;
         Ok(PathBuf::from(home)
             .join("Library")
             .join("Application Support")
@@ -53,53 +60,43 @@ fn firefox_base_dir() -> Result<PathBuf> {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let home = std::env::var("HOME").context("HOME env var not set")?;
+        let home = std::env::var("HOME").context("HOME not set")?;
         Ok(PathBuf::from(home).join(".mozilla").join("firefox"))
     }
 }
 
-fn find_cookie_db() -> Result<PathBuf> {
+fn find_firefox_cookie_db() -> Result<PathBuf> {
     let base = firefox_base_dir()?;
     let ini_path = base.join("profiles.ini");
-
     if !ini_path.exists() {
         anyhow::bail!(
             "Firefox profiles.ini not found at '{}'. Is Firefox installed?",
             ini_path.display()
         );
     }
-
     let ini = std::fs::read_to_string(&ini_path)
         .with_context(|| format!("reading {}", ini_path.display()))?;
-
-    let profile_path = parse_default_profile(&ini)
+    let rel = parse_default_profile(&ini)
         .ok_or_else(|| anyhow::anyhow!("no default Firefox profile found in profiles.ini"))?;
-
-    let absolute = if Path::new(&profile_path).is_absolute() {
-        PathBuf::from(&profile_path)
+    let profile_dir = if Path::new(&rel).is_absolute() {
+        PathBuf::from(&rel)
     } else {
-        base.join(&profile_path)
+        base.join(&rel)
     };
-
-    let db = absolute.join("cookies.sqlite");
+    let db = profile_dir.join("cookies.sqlite");
     if !db.exists() {
         anyhow::bail!(
-            "Firefox cookie database not found at '{}'.\n\
-             Make sure you have logged into Jenkins in Firefox at least once.",
+            "Firefox cookie database not found at '{}'. Log into Jenkins in Firefox first.",
             db.display()
         );
     }
-
     Ok(db)
 }
 
-/// Parse `profiles.ini` and return the path of the default profile.
-/// Prefers the `[Install*]` section's `Default` key (most reliable),
-/// falling back to any `[Profile*]` section with `Default=1`.
+/// Parse `profiles.ini`: prefer `[Install*].Default`, fall back to `[Profile*] Default=1`.
 pub fn parse_default_profile(ini: &str) -> Option<String> {
     let mut install_default: Option<String> = None;
     let mut profile_default: Option<String> = None;
-
     let mut in_install = false;
     let mut in_profile = false;
     let mut cur_path: Option<String> = None;
@@ -107,9 +104,7 @@ pub fn parse_default_profile(ini: &str) -> Option<String> {
 
     for line in ini.lines() {
         let line = line.trim();
-
         if line.starts_with('[') && line.ends_with(']') {
-            // Flush the completed Profile section
             if in_profile && cur_is_default {
                 profile_default = cur_path.take();
             }
@@ -118,77 +113,379 @@ pub fn parse_default_profile(ini: &str) -> Option<String> {
             in_profile = section.starts_with("Profile");
             cur_path = None;
             cur_is_default = false;
-        } else if let Some((key, value)) = line.split_once('=') {
-            let (k, v) = (key.trim(), value.trim());
+        } else if let Some((k, v)) = line.split_once('=') {
+            let (k, v) = (k.trim(), v.trim());
             if in_install && k == "Default" {
                 install_default = Some(v.to_string());
             } else if in_profile {
                 match k {
-                    "Path"    => cur_path = Some(v.to_string()),
+                    "Path" => cur_path = Some(v.to_string()),
                     "Default" if v == "1" => cur_is_default = true,
                     _ => {}
                 }
             }
         }
     }
-
-    // Flush last section
     if in_profile && cur_is_default {
         profile_default = cur_path;
     }
-
     install_default.or(profile_default)
 }
 
-// ── Cookie database query ─────────────────────────────────────────────────────
-
-fn read_cookies(db_path: &Path, hostname: &str) -> Result<String> {
-    // Copy to a temp file so we can read it safely while Firefox is running.
-    let tmp = std::env::temp_dir().join("rj_firefox_cookies.sqlite");
-    std::fs::copy(db_path, &tmp)
-        .with_context(|| format!("copying Firefox cookies from '{}'", db_path.display()))?;
-
+fn query_firefox_cookies(db_path: &Path, hostname: &str) -> Result<String> {
+    let tmp = temp_copy(db_path)?;
     let conn = Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .context("opening Firefox cookie database")?;
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    // Firefox stores cookies with host = "example.com" or host = ".example.com"
+    let now_unix = unix_now_secs() as i64;
     let mut stmt = conn
         .prepare(
             "SELECT name, value FROM moz_cookies
-              WHERE (host = ?1 OR host = ?2)
-                AND expiry > ?3
+              WHERE (host = ?1 OR host = ?2) AND expiry > ?3
               ORDER BY name",
         )
-        .context("preparing cookie query")?;
+        .context("preparing Firefox cookie query")?;
 
     let cookies: Vec<String> = stmt
         .query_map(
-            rusqlite::params![hostname, format!(".{hostname}"), now],
-            |row| {
-                let name: String = row.get(0)?;
-                let value: String = row.get(1)?;
-                Ok(format!("{name}={value}"))
-            },
+            rusqlite::params![hostname, format!(".{hostname}"), now_unix],
+            |row| Ok(format!("{}={}", row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
-        .context("querying cookies")?
+        .context("querying Firefox cookies")?
         .filter_map(|r| r.ok())
         .collect();
 
     std::fs::remove_file(&tmp).ok();
+    require_nonempty(cookies, hostname)
+}
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Chrome
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn chrome_base_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let local = std::env::var("LOCALAPPDATA").context("LOCALAPPDATA env var not set")?;
+        Ok(PathBuf::from(local).join("Google").join("Chrome").join("User Data"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("Google")
+            .join("Chrome"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home).join(".config").join("google-chrome"))
+    }
+}
+
+fn find_chrome_cookie_db() -> Result<PathBuf> {
+    let base = chrome_base_dir()?;
+    // Chrome 96+ moved the file to Network/Cookies; older versions kept it in Default/Cookies
+    let candidates = [
+        base.join("Default").join("Network").join("Cookies"),
+        base.join("Default").join("Cookies"),
+    ];
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Chrome cookie database not found. Is Chrome installed? \
+                 Log into Jenkins in Chrome first."
+            )
+        })
+}
+
+/// Decrypt the Chrome AES master key.
+/// On Windows: read from `Local State`, base64-decode, DPAPI-decrypt.
+/// On macOS: read from Keychain (not yet implemented — see note).
+fn chrome_master_key() -> Result<Vec<u8>> {
+    #[cfg(target_os = "windows")]
+    {
+        let base = chrome_base_dir()?;
+        let state_path = base.join("Local State");
+        let state_json = std::fs::read_to_string(&state_path)
+            .with_context(|| format!("reading Chrome Local State at '{}'", state_path.display()))?;
+
+        // Parse: {"os_crypt":{"encrypted_key":"<base64>"}}
+        let json: serde_json::Value =
+            serde_json::from_str(&state_json).context("parsing Chrome Local State JSON")?;
+        let b64 = json
+            .get("os_crypt")
+            .and_then(|v| v.get("encrypted_key"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("os_crypt.encrypted_key not found in Chrome Local State"))?;
+
+        use base64::Engine;
+        let mut encrypted = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .context("base64-decoding Chrome master key")?;
+
+        // Strip the "DPAPI" prefix Chrome prepends before encrypting
+        const PREFIX: &[u8] = b"DPAPI";
+        if encrypted.starts_with(PREFIX) {
+            encrypted.drain(..PREFIX.len());
+        }
+
+        dpapi::decrypt(&encrypted)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS Chrome stores the encryption password in the Keychain.
+        // The `security` CLI reads it without needing a native Keychain API binding.
+        // Note: the first run may show a Keychain permission prompt in the terminal.
+        let output = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s", "Chrome Safe Storage",
+                "-a", "Chrome",
+                "-w", // output only the password, no metadata
+            ])
+            .output()
+            .context("running 'security' to read Chrome Keychain entry")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "Could not read Chrome Safe Storage password from Keychain: {stderr}\n\
+                 Make sure Chrome has been launched at least once on this Mac."
+            );
+        }
+
+        let password = String::from_utf8(output.stdout)
+            .context("Keychain password is not valid UTF-8")?
+            .trim()
+            .to_string();
+
+        // Derive a 16-byte AES key: PBKDF2-HMAC-SHA1(password, "saltysalt", 1003 iters)
+        let mut key = vec![0u8; 16];
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), b"saltysalt", 1003, &mut key);
+        Ok(key)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        // Linux Chrome uses a hardcoded key or system keyring.
+        // Return empty to signal plaintext-only fallback in query_chrome_cookies.
+        Ok(Vec::new())
+    }
+}
+
+fn query_chrome_cookies(db_path: &Path, hostname: &str, master_key: &[u8]) -> Result<String> {
+    let tmp = temp_copy(db_path)?;
+    let conn = Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context("opening Chrome cookie database")?;
+
+    // Chrome expiry is microseconds since 1601-01-01; session cookies are 0.
+    // Convert Unix now → Chrome epoch: add the 369-year offset in µs.
+    let chrome_now = unix_now_secs() * 1_000_000 + 11_644_473_600_000_000u64;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, value, encrypted_value FROM cookies
+              WHERE (host_key = ?1 OR host_key = ?2)
+                AND (expires_utc = 0 OR expires_utc > ?3)
+              ORDER BY name",
+        )
+        .context("preparing Chrome cookie query")?;
+
+    let cookies: Vec<String> = stmt
+        .query_map(
+            rusqlite::params![hostname, format!(".{hostname}"), chrome_now as i64],
+            |row| {
+                let name: String = row.get(0)?;
+                let value: String = row.get(1)?;
+                let enc: Vec<u8> = row.get(2)?;
+                Ok((name, value, enc))
+            },
+        )
+        .context("querying Chrome cookies")?
+        .filter_map(|r| r.ok())
+        .filter_map(|(name, plaintext, enc)| {
+            let value = if !plaintext.is_empty() {
+                plaintext
+            } else if !enc.is_empty() && !master_key.is_empty() {
+                chrome_decrypt(&enc, master_key).ok()?
+            } else {
+                return None;
+            };
+            Some(format!("{name}={value}"))
+        })
+        .collect();
+
+    std::fs::remove_file(&tmp).ok();
+    require_nonempty(cookies, hostname)
+}
+
+/// Decrypt a single Chrome cookie value — dispatches to the right algorithm per OS.
+fn chrome_decrypt(encrypted: &[u8], key: &[u8]) -> Result<String> {
+    #[cfg(target_os = "windows")]
+    return chrome_decrypt_gcm(encrypted, key);
+
+    #[cfg(target_os = "macos")]
+    return chrome_decrypt_cbc(encrypted, key);
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (encrypted, key);
+        anyhow::bail!("Chrome cookie decryption is not supported on this platform")
+    }
+}
+
+/// Windows: AES-256-GCM. Format: "v10"|"v20" (3 B) + nonce (12 B) + ciphertext+tag.
+#[cfg(target_os = "windows")]
+fn chrome_decrypt_gcm(encrypted: &[u8], key: &[u8]) -> Result<String> {
+    use aes_gcm::{
+        aead::{Aead, KeyInit},
+        Aes256Gcm, Nonce,
+    };
+
+    const PREFIX: usize = 3;
+    const NONCE:  usize = 12;
+
+    if encrypted.len() < PREFIX + NONCE {
+        anyhow::bail!("encrypted cookie value too short");
+    }
+    let nonce = Nonce::from_slice(&encrypted[PREFIX..PREFIX + NONCE]);
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| anyhow::anyhow!("invalid AES-256 key length"))?;
+    let plaintext = cipher
+        .decrypt(nonce, &encrypted[PREFIX + NONCE..])
+        .map_err(|_| anyhow::anyhow!("AES-GCM decryption failed"))?;
+
+    String::from_utf8(plaintext).context("cookie is not valid UTF-8")
+}
+
+/// macOS: AES-128-CBC. Format: "v10" (3 B) + ciphertext (PKCS7-padded).
+/// IV is always 16 space bytes (0x20). Key is 16 bytes derived via PBKDF2.
+#[cfg(target_os = "macos")]
+fn chrome_decrypt_cbc(encrypted: &[u8], key: &[u8]) -> Result<String> {
+    use aes::Aes128;
+    use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+
+    type Aes128CbcDec = cbc::Decryptor<Aes128>;
+
+    const PREFIX: usize = 3;
+    const IV: [u8; 16] = [0x20u8; 16]; // 16 space characters
+
+    if encrypted.len() < PREFIX {
+        anyhow::bail!("encrypted cookie value too short");
+    }
+    let key16: &[u8; 16] = key
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Chrome CBC key must be exactly 16 bytes"))?;
+
+    let mut buf = encrypted[PREFIX..].to_vec();
+    let decrypted = Aes128CbcDec::new(key16.into(), &IV.into())
+        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .map_err(|_| anyhow::anyhow!("AES-128-CBC decryption failed"))?;
+
+    String::from_utf8(decrypted.to_vec()).context("cookie is not valid UTF-8")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Windows DPAPI
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+mod dpapi {
+    use anyhow::Result;
+    use std::ptr;
+
+    #[repr(C)]
+    struct DataBlob {
+        cb_data: u32,
+        pb_data: *mut u8,
+    }
+
+    #[link(name = "crypt32")]
+    extern "system" {
+        fn CryptUnprotectData(
+            p_data_in: *const DataBlob,
+            pp_sz_descr: *mut *mut u16,
+            p_entropy: *const DataBlob,
+            pv_reserved: *mut core::ffi::c_void,
+            p_prompt: *const core::ffi::c_void,
+            dw_flags: u32,
+            p_data_out: *mut DataBlob,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(h_mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    pub fn decrypt(data: &[u8]) -> Result<Vec<u8>> {
+        let input = DataBlob {
+            cb_data: data.len() as u32,
+            pb_data: data.as_ptr() as *mut u8,
+        };
+        let mut output = DataBlob {
+            cb_data: 0,
+            pb_data: ptr::null_mut(),
+        };
+
+        let ok = unsafe {
+            CryptUnprotectData(
+                &input as *const DataBlob,
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null(),
+                0,
+                &mut output as *mut DataBlob,
+            )
+        };
+
+        if ok == 0 {
+            anyhow::bail!(
+                "DPAPI decryption failed — make sure you are logged in as the same \
+                 Windows user who runs Chrome"
+            );
+        }
+
+        let decrypted =
+            unsafe { std::slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec() };
+        unsafe { LocalFree(output.pb_data as *mut core::ffi::c_void) };
+        Ok(decrypted)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn temp_copy(src: &Path) -> Result<PathBuf> {
+    let dst = std::env::temp_dir().join("rj_browser_cookies.sqlite");
+    std::fs::copy(src, &dst)
+        .with_context(|| format!("copying cookie database from '{}'", src.display()))?;
+    Ok(dst)
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn require_nonempty(cookies: Vec<String>, hostname: &str) -> Result<String> {
     if cookies.is_empty() {
         anyhow::bail!(
-            "no valid session cookies found for '{}' in Firefox.\n\
-             Log into Jenkins in Firefox first, then re-run this command.",
+            "no valid session cookies found for '{}' in your browser.\n\
+             Make sure you are logged into Jenkins in the browser, then retry.",
             hostname
         );
     }
-
     Ok(cookies.join("; "))
 }
 
@@ -234,7 +531,7 @@ mod tests {
         );
     }
 
-    // ── parse_default_profile ─────────────────────────────────────────────────
+    // ── parse_default_profile (Firefox) ──────────────────────────────────────
 
     #[test]
     fn parse_default_profile_prefers_install_section() {
@@ -267,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_default_profile_picks_correct_profile_when_multiple_exist() {
+    fn parse_default_profile_picks_correct_when_multiple_profiles() {
         let ini = "[Profile0]\n\
                    Name=work\n\
                    IsRelative=1\n\
@@ -291,5 +588,57 @@ mod tests {
                    IsRelative=1\n\
                    Path=Profiles/abc.default\n";
         assert!(parse_default_profile(ini).is_none());
+    }
+
+    // ── chrome_decrypt ────────────────────────────────────────────────────────
+
+    // Windows: AES-256-GCM
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn chrome_decrypt_gcm_roundtrip() {
+        use aes_gcm::{
+            aead::{Aead, KeyInit, OsRng},
+            Aes256Gcm,
+        };
+        let key = Aes256Gcm::generate_key(OsRng);
+        let cipher = Aes256Gcm::new(&key);
+        let nonce_bytes = [1u8; 12];
+        let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, b"JSESSIONID-value".as_ref()).unwrap();
+        let mut wire = b"v10".to_vec();
+        wire.extend_from_slice(&nonce_bytes);
+        wire.extend_from_slice(&ciphertext);
+        assert_eq!(chrome_decrypt(&wire, &key).unwrap(), "JSESSIONID-value");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn chrome_decrypt_gcm_rejects_too_short_input() {
+        assert!(chrome_decrypt(b"v10short", &vec![0u8; 32]).is_err());
+    }
+
+    // macOS: AES-128-CBC
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn chrome_decrypt_cbc_roundtrip() {
+        use aes::Aes128;
+        use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+        type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+
+        let key = [0x42u8; 16];
+        let iv  = [0x20u8; 16];
+        let ciphertext = Aes128CbcEnc::new(&key.into(), &iv.into())
+            .encrypt_padded_vec_mut::<Pkcs7>(b"JSESSIONID-value");
+
+        let mut wire = b"v10".to_vec();
+        wire.extend_from_slice(&ciphertext);
+
+        assert_eq!(chrome_decrypt_cbc(&wire, &key).unwrap(), "JSESSIONID-value");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn chrome_decrypt_cbc_rejects_too_short_input() {
+        assert!(chrome_decrypt_cbc(b"v1", &[0u8; 16]).is_err());
     }
 }

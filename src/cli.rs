@@ -16,15 +16,20 @@ pub struct Cli {
     #[arg(long, global = true, env = "JENKINS_TOKEN", default_value = "XXXXX")]
     pub token: String,
 
-    /// Read the session cookie from your default Firefox profile instead of
-    /// using username/token. Use this when Jenkins is behind SSO (e.g. Okta).
-    /// Log into Jenkins in Firefox first, then run any rj command with this flag.
+    /// Read the session cookie from your default Firefox profile.
+    /// Use when Jenkins is behind SSO (e.g. Okta) — log in via Firefox first.
     #[arg(long, global = true, default_value_t = false)]
-    pub from_browser: bool,
+    pub from_firefox: bool,
 
-    /// Explicit session cookie string to use for authentication
-    /// (e.g. "JSESSIONID=abc123"). Overrides --from-browser.
-    /// Can also be set via JENKINS_COOKIE env var.
+    /// Read the session cookie from your default Chrome profile.
+    /// Use when Jenkins is behind SSO (e.g. Okta) — log in via Chrome first.
+    /// On Windows, Chrome cookie values are decrypted automatically via DPAPI.
+    #[arg(long, global = true, default_value_t = false)]
+    pub from_chrome: bool,
+
+    /// Explicit session cookie string (e.g. "JSESSIONID=abc123").
+    /// Overrides --from-firefox and --from-chrome.
+    /// Can also be set via the JENKINS_COOKIE env var.
     #[arg(long, global = true, env = "JENKINS_COOKIE")]
     pub cookie: Option<String>,
 
