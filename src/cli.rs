@@ -33,6 +33,9 @@ pub enum Command {
 
     /// Get or set a job's XML configuration
     Config(ConfigArgs),
+
+    /// Run a job repeatedly, varying one parameter each time, and save each build's log
+    Sweep(SweepArgs),
 }
 
 // ── inspect ──────────────────────────────────────────────────────────────────
@@ -101,6 +104,36 @@ pub struct ConfigSetArgs {
 
     /// Path to the local config.xml file to upload
     pub file: String,
+}
+
+// ── sweep ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct SweepArgs {
+    /// Jenkins job name
+    pub job: String,
+
+    /// Name of the parameter to vary across builds
+    #[arg(long)]
+    pub param_name: String,
+
+    /// Values to iterate through — one build is triggered per value.
+    /// Accepts a space-separated list after a single flag, so a shell array
+    /// expands naturally: --value "${foo[@]}"
+    #[arg(long = "value", short = 'v', num_args = 1..)]
+    pub values: Vec<String>,
+
+    /// Additional fixed parameters applied to every build (-p KEY=VALUE)
+    #[arg(short = 'p', long = "param", value_name = "KEY=VALUE")]
+    pub params: Vec<String>,
+
+    /// Directory where per-build log files are written (created if absent)
+    #[arg(long, default_value = "sweep-logs")]
+    pub output_dir: String,
+
+    /// Polling interval in milliseconds (queue wait and build-complete wait)
+    #[arg(long, default_value_t = 2000)]
+    pub poll_ms: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -249,6 +282,47 @@ mod tests {
                 _ => panic!("expected Set variant"),
             },
             _ => panic!("expected Config variant"),
+        }
+    }
+
+    // ── sweep ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sweep_accepts_repeated_value_flags() {
+        // Traditional: one --value flag per item
+        let cli = parse(&["sweep", "my-job", "--param-name", "ENV",
+                          "--value", "staging", "--value", "prod"]);
+        match cli.command {
+            Command::Sweep(args) => assert_eq!(args.values, vec!["staging", "prod"]),
+            _ => panic!("expected Sweep variant"),
+        }
+    }
+
+    #[test]
+    fn sweep_accepts_multiple_values_after_single_flag() {
+        // Shell array style: --value "${foo[@]}" expands to --value bar baz bam
+        let cli = parse(&["sweep", "my-job", "--param-name", "ENV",
+                          "--value", "bar", "baz", "bam",
+                          "-p", "VERSION=1.0"]);
+        match cli.command {
+            Command::Sweep(args) => {
+                assert_eq!(args.values, vec!["bar", "baz", "bam"]);
+                assert_eq!(args.params, vec!["VERSION=1.0"]);
+            }
+            _ => panic!("expected Sweep variant"),
+        }
+    }
+
+    #[test]
+    fn sweep_defaults() {
+        let cli = parse(&["sweep", "my-job", "--param-name", "ENV", "--value", "x"]);
+        match cli.command {
+            Command::Sweep(args) => {
+                assert_eq!(args.output_dir, "sweep-logs");
+                assert_eq!(args.poll_ms, 2000);
+                assert!(args.params.is_empty());
+            }
+            _ => panic!("expected Sweep variant"),
         }
     }
 }

@@ -11,6 +11,7 @@ A modular, async Rust CLI for the Jenkins REST API.
 | `logs` | Stream live console output by polling `progressiveText` |
 | `config get` | Download and print a job's `config.xml` |
 | `config set` | Upload a local `config.xml` to replace a job's configuration |
+| `sweep` | Run a job repeatedly, varying one parameter each time, and save each build's log |
 
 All commands handle Basic Auth and Jenkins CSRF crumbs automatically.
 
@@ -184,18 +185,82 @@ The request is sent with `Content-Type: application/xml` and the CSRF crumb atta
 
 ---
 
+### `sweep`
+
+Run a job repeatedly, varying one parameter across a list of values. Each build runs to completion before the next is triggered, and the full console log is saved to disk.
+
+```bash
+rj sweep <job> \
+    --param-name <KEY> \
+    --value <val1> <val2> <val3> \
+    [--output-dir <dir>] \
+    [--poll-ms <ms>] \
+    [-p KEY=VALUE]...
+```
+
+**With a shell array (bash/zsh):**
+
+```bash
+envs=("staging" "prod" "dev")
+
+rj sweep my-job \
+    --param-name ENV \
+    --value "${envs[@]}" \
+    -p VERSION=1.0 \
+    --output-dir ./results \
+    --poll-ms 3000
+```
+
+> Use `"${array[@]}"` — not `$array` (first element only) or `"${array[*]}"` (single string).
+
+**Console output:**
+
+```
+[1/3] ENV=staging
+  Queued as build #42
+  Result: SUCCESS
+  Log:    results/my-job__ENV__staging__#42.log
+
+[2/3] ENV=prod
+  Queued as build #43
+  Result: SUCCESS
+  Log:    results/my-job__ENV__prod__#43.log
+
+[3/3] ENV=dev
+  Queued as build #44
+  Result: FAILURE
+  Log:    results/my-job__ENV__dev__#44.log
+
+Sweep complete. Logs in 'results'.
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--param-name` | *(required)* | The parameter to vary |
+| `--value` / `-v` | *(required)* | One or more values — space-separated list or repeated flags |
+| `-p KEY=VALUE` | | Fixed parameters passed to every build |
+| `--output-dir` | `sweep-logs` | Directory for log files (created if absent) |
+| `--poll-ms` | `2000` | How often to poll the queue and build status |
+
+Log files are named `{job}__{param}__{value}__#{build}.log`. A build failure or cancellation is logged and the sweep continues with the next value.
+
+---
+
 ## Architecture
 
 ```
 src/
-├── main.rs              # #[tokio::main] entry point and 4-arm command dispatch
+├── main.rs              # #[tokio::main] entry point — parses CLI, builds client, dispatches
 ├── cli.rs               # clap derive structs for all commands and subcommands
 ├── client.rs            # JenkinsClient — Basic Auth, CSRF crumb fetch & cache
 └── commands/
     ├── inspect.rs       # Job/parameter JSON deserialisation and display
     ├── build.rs         # Plain and parameterized POST build trigger
     ├── logs.rs          # Async progressive-text polling loop
-    └── config.rs        # XML config GET and POST
+    ├── config.rs        # XML config GET and POST
+    └── sweep.rs         # Multi-build loop: queue polling, build-wait, log saving
 ```
 
 **Key dependencies:**
@@ -217,12 +282,13 @@ src/
 cargo test
 ```
 
-58 tests across all modules, covering:
+74 tests across all modules, covering:
 
-- CLI argument parsing (unit)
+- CLI argument parsing including shell-array-style multi-value flags (unit)
 - Basic Auth header attachment (wiremock)
 - CSRF crumb fetch, attachment, and caching (wiremock)
 - Job JSON deserialisation for String, Boolean, and Choice parameters (unit)
 - Plain and parameterized build POST with form body verification (wiremock)
 - Log streaming: `X-Text-Size` offset advancement and `X-More-Data` loop control (wiremock + unit)
 - `config.xml` GET and POST with `Content-Type: application/xml` verification (wiremock)
+- Sweep: queue item polling, build-complete polling, log file writing, full end-to-end loop (wiremock + unit)
