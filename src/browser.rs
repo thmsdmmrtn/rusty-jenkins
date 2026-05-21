@@ -18,11 +18,54 @@ pub fn firefox_cookies(jenkins_url: &str) -> Result<String> {
 }
 
 /// Return a `Cookie: …` header value from the Chrome cookie database.
-pub fn chrome_cookies(jenkins_url: &str) -> Result<String> {
+/// `profile` is the Chrome profile folder name (e.g. `"Default"`, `"Profile 1"`).
+pub fn chrome_cookies(jenkins_url: &str, profile: &str) -> Result<String> {
     let hostname = extract_hostname(jenkins_url)?;
-    let db = find_chrome_cookie_db()?;
-    let key = chrome_master_key()?;
+    let db = find_chrome_cookie_db(profile)?;
+    let key = chrome_master_key(profile)?;
     query_chrome_cookies(&db, &hostname, &key)
+}
+
+/// Print the names of every cookie found for the Jenkins hostname — no values.
+/// Useful for diagnosing auth issues without exposing secrets.
+pub fn list_cookie_names(jenkins_url: &str, browser: &str, profile: &str) -> Result<()> {
+    let hostname = extract_hostname(jenkins_url)?;
+    println!("Looking for cookies matching host: {hostname}");
+
+    let names: Vec<String> = match browser {
+        "chrome" => {
+            let db = find_chrome_cookie_db(profile)?;
+            let key = chrome_master_key(profile)?;
+            cookie_names_chrome(&db, &hostname, &key)?
+        }
+        "firefox" => {
+            let db = find_firefox_cookie_db()?;
+            cookie_names_firefox(&db, &hostname)?
+        }
+        other => anyhow::bail!("unknown browser '{other}' — use 'chrome' or 'firefox'"),
+    };
+
+    if names.is_empty() {
+        println!("No cookies found.");
+        println!();
+        println!("Troubleshooting:");
+        println!("  • Make sure you are logged into Jenkins in {browser}");
+        if browser == "chrome" {
+            println!("  • Check your active Chrome profile: open chrome://version and look for");
+            println!("    'Profile Path'. Pass the folder name with --chrome-profile \"<name>\"");
+            println!("    Common names: \"Default\", \"Profile 1\", \"Profile 2\"");
+        }
+        println!("  • The cookie may have expired — log in again and retry");
+    } else {
+        println!("Found {} cookie(s):", names.len());
+        for name in &names {
+            println!("  {name}");
+        }
+        println!();
+        println!("To use these cookies, run with --from-{browser}");
+    }
+
+    Ok(())
 }
 
 // ── Hostname extraction ───────────────────────────────────────────────────────
@@ -185,20 +228,21 @@ fn chrome_base_dir() -> Result<PathBuf> {
     }
 }
 
-fn find_chrome_cookie_db() -> Result<PathBuf> {
+fn find_chrome_cookie_db(profile: &str) -> Result<PathBuf> {
     let base = chrome_base_dir()?;
-    // Chrome 96+ moved the file to Network/Cookies; older versions kept it in Default/Cookies
+    // Chrome 96+ moved the file to Network/Cookies; older versions kept it in <profile>/Cookies
     let candidates = [
-        base.join("Default").join("Network").join("Cookies"),
-        base.join("Default").join("Cookies"),
+        base.join(profile).join("Network").join("Cookies"),
+        base.join(profile).join("Cookies"),
     ];
     candidates
         .into_iter()
         .find(|p| p.exists())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Chrome cookie database not found. Is Chrome installed? \
-                 Log into Jenkins in Chrome first."
+                "Chrome cookie database not found for profile '{profile}'.\n\
+                 Check your active profile name at chrome://version (look for 'Profile Path').\n\
+                 Pass it with --chrome-profile \"Profile 1\" (or whichever name matches)."
             )
         })
 }
@@ -206,7 +250,9 @@ fn find_chrome_cookie_db() -> Result<PathBuf> {
 /// Decrypt the Chrome AES master key.
 /// On Windows: read from `Local State`, base64-decode, DPAPI-decrypt.
 /// On macOS: read from Keychain (not yet implemented — see note).
-fn chrome_master_key() -> Result<Vec<u8>> {
+fn chrome_master_key(profile: &str) -> Result<Vec<u8>> {
+    // profile is unused on Windows/macOS (key is global, not per-profile)
+    let _ = profile;
     #[cfg(target_os = "windows")]
     {
         let base = chrome_base_dir()?;
@@ -326,6 +372,48 @@ fn query_chrome_cookies(db_path: &Path, hostname: &str, master_key: &[u8]) -> Re
 }
 
 /// Decrypt a single Chrome cookie value — dispatches to the right algorithm per OS.
+fn cookie_names_firefox(db_path: &Path, hostname: &str) -> Result<Vec<String>> {
+    let tmp = temp_copy(db_path)?;
+    let conn = Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let now = unix_now_secs() as i64;
+    let mut stmt = conn.prepare(
+        "SELECT name FROM moz_cookies
+          WHERE (host = ?1 OR host = ?2) AND expiry > ?3
+          ORDER BY name",
+    )?;
+    let names = stmt
+        .query_map(rusqlite::params![hostname, format!(".{hostname}"), now], |r| r.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    std::fs::remove_file(&tmp).ok();
+    Ok(names)
+}
+
+fn cookie_names_chrome(db_path: &Path, hostname: &str, master_key: &[u8]) -> Result<Vec<String>> {
+    let tmp = temp_copy(db_path)?;
+    let conn = Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let chrome_now = unix_now_secs() * 1_000_000 + 11_644_473_600_000_000u64;
+    let mut stmt = conn.prepare(
+        "SELECT name FROM cookies
+          WHERE (host_key = ?1 OR host_key = ?2)
+            AND (expires_utc = 0 OR expires_utc > ?3)
+          ORDER BY name",
+    )?;
+    let names: Vec<String> = stmt
+        .query_map(
+            rusqlite::params![hostname, format!(".{hostname}"), chrome_now as i64],
+            |r| r.get(0),
+        )?
+        .filter_map(|r| r.ok())
+        // Only list names we can actually use (have a value, encrypted or plain)
+        .collect();
+    // Also check for any cookies we'd skip due to decryption — show those too
+    // (we query names-only here so no decryption needed)
+    let _ = master_key;
+    std::fs::remove_file(&tmp).ok();
+    Ok(names)
+}
+
 fn chrome_decrypt(encrypted: &[u8], key: &[u8]) -> Result<String> {
     #[cfg(target_os = "windows")]
     return chrome_decrypt_gcm(encrypted, key);

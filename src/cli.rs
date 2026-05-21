@@ -27,11 +27,23 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub from_chrome: bool,
 
-    /// Explicit session cookie string (e.g. "JSESSIONID=abc123").
-    /// Overrides --from-firefox and --from-chrome.
+    /// Chrome profile directory name to read cookies from (default: "Default").
+    /// If you use a non-default Chrome profile (e.g. a work profile) set this
+    /// to the profile folder name shown in chrome://version (e.g. "Profile 1").
+    #[arg(long, global = true, default_value = "Default")]
+    pub chrome_profile: String,
+
+    /// Explicit session cookie string (e.g. "JSESSIONID.abc=value123").
+    /// Must be in name=value format. Overrides --from-firefox and --from-chrome.
     /// Can also be set via the JENKINS_COOKIE env var.
     #[arg(long, global = true, env = "JENKINS_COOKIE")]
     pub cookie: Option<String>,
+
+    /// Print cookie names found in the browser for the Jenkins hostname, then exit.
+    /// Use this to diagnose --from-chrome or --from-firefox authentication issues.
+    /// Cookie values are NOT printed.
+    #[arg(long, global = true, default_value_t = false)]
+    pub list_cookies: bool,
 
     #[command(subcommand)]
     pub command: Command,
