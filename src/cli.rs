@@ -211,6 +211,13 @@ pub struct ConfigSweepArgs {
     #[arg(long)]
     pub branch: Option<String>,
 
+    /// Skip the automatic branch scan that runs before each branch build.
+    /// By default, rj scans the parent pipeline after each config change so
+    /// Jenkins recognises the new repository before the branch build is triggered.
+    /// Set this flag only if you know the branch is already buildable.
+    #[arg(long, default_value_t = false)]
+    pub skip_scan: bool,
+
     /// Milliseconds to wait after uploading config before triggering the build.
     /// Jenkins needs time to process config changes; increase this if you get
     /// HTTP 400 errors immediately after config upload.

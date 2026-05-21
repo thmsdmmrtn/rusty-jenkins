@@ -97,7 +97,21 @@ pub async fn run(client: &JenkinsClient, args: &ConfigSweepArgs) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_millis(args.post_config_delay_ms)).await;
         }
 
-        // 3. Trigger a build on the target (branch job or parent pipeline)
+        // 3a. When targeting a specific branch, scan the parent pipeline first.
+        //     After a repo change Jenkins marks branch jobs stale until a new
+        //     scan confirms the branch exists in the new repo — without this the
+        //     branch build returns 400 no matter how long we wait.
+        if args.branch.is_some() && !args.skip_scan {
+            println!("  Scanning parent pipeline to index new repository…");
+            match run_scan(client, &args.job, args.poll_ms).await {
+                Ok(()) => println!("  Scan complete."),
+                Err(e) => {
+                    eprintln!("  Scan failed: {e:#}. Attempting branch build anyway…");
+                }
+            }
+        }
+
+        // 3b. Trigger a build on the target (branch job or parent pipeline)
         let build_num =
             match trigger_build(client, &build_target, args.poll_ms).await {
                 Ok(n) => { println!("  Queued as build #{n}"); n }
@@ -146,6 +160,36 @@ async fn fetch_config(client: &JenkinsClient, job: &str) -> Result<String> {
         anyhow::bail!("Jenkins returned HTTP {status} fetching config.xml for '{job}'");
     }
     resp.text().await.context("reading config.xml body")
+}
+
+/// Trigger a branch scan (indexing run) on the parent pipeline and wait for
+/// it to finish. This is necessary after a repo config change so Jenkins
+/// re-discovers branches in the new repository before we attempt a branch build.
+async fn run_scan(client: &JenkinsClient, parent_job: &str, poll_ms: u64) -> Result<()> {
+    let resp = client
+        .post(&format!("job/{}/build", encode_job_path(parent_job)))
+        .await?
+        .form(&Vec::<(String, String)>::new())
+        .send()
+        .await
+        .context("triggering branch scan")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("scan trigger returned HTTP {status}");
+    }
+
+    let location = resp
+        .headers()
+        .get("Location")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| anyhow::anyhow!("no Location header in scan response"))?
+        .to_string();
+
+    let queue_id = extract_queue_id(&location)?;
+    let scan_build = poll_queue(client, queue_id, poll_ms).await?;
+    wait_for_completion(client, parent_job, scan_build, poll_ms).await?;
+    Ok(())
 }
 
 async fn upload_config(client: &JenkinsClient, job: &str, xml: &str) -> Result<()> {
@@ -372,6 +416,7 @@ mod tests {
             poll_ms: 0,
             branch: None,
             post_config_delay_ms: 0,
+            skip_scan: true,
             no_restore: false,
         };
 
@@ -451,6 +496,7 @@ mod tests {
             poll_ms: 0,
             branch: None,
             post_config_delay_ms: 0,
+            skip_scan: true,
             no_restore: false,
         };
 
@@ -528,6 +574,7 @@ mod tests {
             poll_ms: 0,
             branch: Some("main".to_string()),
             post_config_delay_ms: 0,
+            skip_scan: true,
             no_restore: false,
         };
 
@@ -578,5 +625,108 @@ mod tests {
         // Use 0ms delay so the test runs instantly
         let build_num = trigger_build(&client, "my-job", 0).await.unwrap();
         assert_eq!(build_num, 5);
+    }
+
+    #[tokio::test]
+    async fn scan_runs_before_branch_build_when_skip_scan_is_false() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/crumbIssuer/api/json"))
+            .respond_with(crumb())
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/job/my-pipeline/config.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_XML))
+            .mount(&server)
+            .await;
+
+        // Config upload (patched) + restore
+        Mock::given(method("POST"))
+            .and(path("/job/my-pipeline/config.xml"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // Scan triggered on parent pipeline — must happen before branch build
+        Mock::given(method("POST"))
+            .and(path("/job/my-pipeline/build"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .append_header("Location", format!("{}/queue/item/1/", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/queue/item/1/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                "executable": { "number": 10, "url": "http://x" }
+            })))
+            .mount(&server)
+            .await;
+
+        // Scan build completes
+        Mock::given(method("GET"))
+            .and(path("/job/my-pipeline/10/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                "building": false, "result": "SUCCESS"
+            })))
+            .mount(&server)
+            .await;
+
+        // Branch build triggered after scan
+        Mock::given(method("POST"))
+            .and(path("/job/my-pipeline/job/main/build"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .append_header("Location", format!("{}/queue/item/2/", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/queue/item/2/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                "executable": { "number": 20, "url": "http://x" }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/job/my-pipeline/job/main/20/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                "building": false, "result": "SUCCESS"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/job/my-pipeline/job/main/20/consoleText"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("log\n"))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join("rj_config_sweep_scan_test");
+        let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
+        let args = ConfigSweepArgs {
+            job: "my-pipeline".to_string(),
+            xml_tag: "repository".to_string(),
+            values: vec!["repo-y".to_string()],
+            output_dir: tmp.to_str().unwrap().to_string(),
+            poll_ms: 0,
+            branch: Some("main".to_string()),
+            post_config_delay_ms: 0,
+            skip_scan: false,   // scan runs first
+            no_restore: false,
+        };
+
+        run(&client, &args).await.unwrap();
+        std::fs::remove_dir_all(&tmp).ok();
+        // wiremock asserts expect(1) on both the scan POST and branch POST
     }
 }
