@@ -205,6 +205,12 @@ pub struct ConfigSweepArgs {
     #[arg(long, default_value_t = 2000)]
     pub poll_ms: u64,
 
+    /// Build a specific branch of the pipeline instead of triggering a scan.
+    /// Use this with multibranch pipelines to avoid kicking off every branch.
+    /// e.g. --branch main
+    #[arg(long)]
+    pub branch: Option<String>,
+
     /// Skip restoring the original config.xml after the sweep completes
     #[arg(long, default_value_t = false)]
     pub no_restore: bool,

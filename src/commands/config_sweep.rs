@@ -48,6 +48,20 @@ pub async fn run(client: &JenkinsClient, args: &ConfigSweepArgs) -> Result<()> {
         anyhow::bail!("provide at least one --value to sweep over");
     }
 
+    // Config is always read/written on the parent pipeline job.
+    // Builds, waits, and logs target the specific branch when --branch is given.
+    let build_target = match &args.branch {
+        Some(branch) => format!("{}/{}", args.job, branch),
+        None => args.job.clone(),
+    };
+
+    if let Some(branch) = &args.branch {
+        println!(
+            "Config: '{}' — Build target: '{}/{}' (no branch scan triggered)",
+            args.job, args.job, branch
+        );
+    }
+
     let out_dir = Path::new(&args.output_dir);
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("creating output directory '{}'", args.output_dir))?;
@@ -60,7 +74,7 @@ pub async fn run(client: &JenkinsClient, args: &ConfigSweepArgs) -> Result<()> {
     for (i, value) in args.values.iter().enumerate() {
         println!("\n[{}/{}] <{}> = {}", i + 1, total, args.xml_tag, value);
 
-        // 1. Patch the config XML
+        // 1. Patch the parent pipeline's config XML
         let patched = match patch_xml_tag(&original_xml, &args.xml_tag, value) {
             Ok(xml) => xml,
             Err(e) => {
@@ -69,31 +83,31 @@ pub async fn run(client: &JenkinsClient, args: &ConfigSweepArgs) -> Result<()> {
             }
         };
 
-        // 2. Upload the patched config
+        // 2. Upload the patched config to the parent pipeline
         if let Err(e) = upload_config(client, &args.job, &patched).await {
             eprintln!("  Could not upload config: {e:#}");
             continue;
         }
         println!("  Config updated.");
 
-        // 3. Trigger a plain build (no parameters — the config change IS the variation)
+        // 3. Trigger a build on the target (branch job or parent pipeline)
         let build_num =
-            match trigger_build(client, &args.job, args.poll_ms).await {
+            match trigger_build(client, &build_target, args.poll_ms).await {
                 Ok(n) => { println!("  Queued as build #{n}"); n }
                 Err(e) => { eprintln!("  Could not trigger build: {e:#}"); continue; }
             };
 
-        // 4. Wait for completion
+        // 4. Wait for completion on the build target
         let result =
-            match wait_for_completion(client, &args.job, build_num, args.poll_ms).await {
+            match wait_for_completion(client, &build_target, build_num, args.poll_ms).await {
                 Ok(r) => r.unwrap_or_else(|| "UNKNOWN".to_string()),
                 Err(e) => { eprintln!("  Error waiting for build: {e:#}"); continue; }
             };
         println!("  Result: {result}");
 
-        // 5. Save the console log
-        let log_path = log_filename(out_dir, &args.job, &args.xml_tag, value, build_num);
-        match save_log(client, &args.job, build_num, &log_path).await {
+        // 5. Save the console log from the build target
+        let log_path = log_filename(out_dir, &build_target, &args.xml_tag, value, build_num);
+        match save_log(client, &build_target, build_num, &log_path).await {
             Ok(()) => println!("  Log:    {}", log_path.display()),
             Err(e) => eprintln!("  Could not save log: {e:#}"),
         }
@@ -180,9 +194,10 @@ async fn save_log(client: &JenkinsClient, job: &str, build: u64, path: &Path) ->
     std::fs::write(path, text).with_context(|| format!("writing log to '{}'", path.display()))
 }
 
-fn log_filename(dir: &Path, job: &str, tag: &str, value: &str, build: u64) -> PathBuf {
-    let safe = value.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '], "_");
-    dir.join(format!("{job}__{tag}__{safe}__#{build}.log"))
+fn log_filename(dir: &Path, build_target: &str, tag: &str, value: &str, build: u64) -> PathBuf {
+    let safe_target = build_target.replace('/', "__");
+    let safe_value  = value.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '], "_");
+    dir.join(format!("{safe_target}__{tag}__{safe_value}__#{build}.log"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -327,6 +342,7 @@ mod tests {
             values: vec!["repo-a".to_string(), "repo-b".to_string()],
             output_dir: tmp_dir.to_str().unwrap().to_string(),
             poll_ms: 0,
+            branch: None,
             no_restore: false,
         };
 
@@ -404,11 +420,90 @@ mod tests {
             values: vec!["patched-repo".to_string()],
             output_dir: tmp.to_str().unwrap().to_string(),
             poll_ms: 0,
+            branch: None,
             no_restore: false,
         };
 
         run(&client, &args).await.unwrap();
         std::fs::remove_dir_all(&tmp).ok();
         // wiremock asserts expect(1) on both POST mocks on drop
+    }
+
+    #[tokio::test]
+    async fn branch_flag_builds_branch_job_not_parent_pipeline() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/crumbIssuer/api/json"))
+            .respond_with(crumb())
+            .mount(&server)
+            .await;
+
+        // Config is fetched/uploaded on the PARENT pipeline
+        Mock::given(method("GET"))
+            .and(path("/job/my-pipeline/config.xml"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(SAMPLE_XML),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/job/my-pipeline/config.xml"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // Build is triggered on the BRANCH, not the parent
+        Mock::given(method("POST"))
+            .and(path("/job/my-pipeline/job/main/build"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .append_header("Location", format!("{}/queue/item/9/", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/queue/item/9/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                "executable": { "number": 77, "url": "http://x" }
+            })))
+            .mount(&server)
+            .await;
+
+        // Status and logs come from the BRANCH build
+        Mock::given(method("GET"))
+            .and(path("/job/my-pipeline/job/main/77/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                "building": false, "result": "SUCCESS"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/job/my-pipeline/job/main/77/consoleText"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("branch log\n"))
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join("rj_config_sweep_branch_test");
+        let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
+        let args = ConfigSweepArgs {
+            job: "my-pipeline".to_string(),
+            xml_tag: "repository".to_string(),
+            values: vec!["repo-x".to_string()],
+            output_dir: tmp.to_str().unwrap().to_string(),
+            poll_ms: 0,
+            branch: Some("main".to_string()),
+            no_restore: false,
+        };
+
+        run(&client, &args).await.unwrap();
+
+        // Log file path reflects the branch job, not the parent
+        assert!(tmp.join("my-pipeline__main__repository__repo-x__#77.log").exists());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
