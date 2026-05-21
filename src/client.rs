@@ -22,6 +22,9 @@ pub struct JenkinsClient {
     pub base_url: String,
     username: String,
     token: String,
+    /// When set, sent as a `Cookie` header instead of Basic Auth.
+    /// Used for SSO environments where password auth isn't available.
+    cookie: Option<String>,
     http: Client,
     /// Lazily fetched and cached for the lifetime of this client instance.
     crumb_cache: Mutex<Option<CrumbEntry>>,
@@ -33,14 +36,31 @@ impl JenkinsClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             username: username.into(),
             token: token.into(),
+            cookie: None,
             http: Client::new(),
             crumb_cache: Mutex::new(None),
         }
     }
 
-    /// Attach Basic Auth credentials to any request builder.
+    pub fn new_with_cookie(base_url: impl Into<String>, cookie: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            username: String::new(),
+            token: String::new(),
+            cookie: Some(cookie.into()),
+            http: Client::new(),
+            crumb_cache: Mutex::new(None),
+        }
+    }
+
+    /// Attach authentication to a request.
+    /// Cookie auth takes precedence over Basic Auth when both are present.
     fn with_auth(&self, req: RequestBuilder) -> RequestBuilder {
-        req.basic_auth(&self.username, Some(&self.token))
+        if let Some(cookie) = &self.cookie {
+            req.header("Cookie", cookie)
+        } else {
+            req.basic_auth(&self.username, Some(&self.token))
+        }
     }
 
     /// Build a full URL from a relative path.

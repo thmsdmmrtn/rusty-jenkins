@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
+mod browser;
 mod cli;
 mod client;
 mod commands;
@@ -19,7 +20,18 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let client = JenkinsClient::new(&cli.url, &cli.user, &cli.token);
+
+    // Resolve authentication: explicit cookie > --from-browser > Basic Auth
+    let client = if let Some(cookie) = &cli.cookie {
+        JenkinsClient::new_with_cookie(&cli.url, cookie)
+    } else if cli.from_browser {
+        let cookie = browser::firefox_cookies(&cli.url)
+            .context("reading session cookies from Firefox")?;
+        println!("Using Firefox session cookies for authentication.");
+        JenkinsClient::new_with_cookie(&cli.url, cookie)
+    } else {
+        JenkinsClient::new(&cli.url, &cli.user, &cli.token)
+    };
 
     match &cli.command {
         Command::Inspect(args) => commands::inspect::run(&client, args).await,
