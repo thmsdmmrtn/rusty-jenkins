@@ -422,6 +422,8 @@ Iterate over a list of values by patching an XML tag in the job's `config.xml` b
 rj config-sweep <job> \
     --xml-tag <tag> \
     --value <val1> <val2> <val3> \
+    [--branch <branch>] \
+    [--post-config-delay-ms <ms>] \
     [--output-dir <dir>] \
     [--poll-ms <ms>] \
     [--no-restore]
@@ -430,8 +432,8 @@ rj config-sweep <job> \
 **Finding the right tag name:**
 
 ```bash
-# Inspect the XML first to find the field you want to change
-rj config get folder/my-job | grep -A2 -B2 repository
+# Inspect the parent pipeline's XML to find the field you want to change
+rj config get PIPELINE-NAME | grep -A2 -B2 repository
 ```
 
 For a GitHub Branch Source the tag is typically `<repository>`:
@@ -442,38 +444,42 @@ For a GitHub Branch Source the tag is typically `<repository>`:
   <repository>my-repo</repository>   ← --xml-tag repository
 ```
 
-**Example:**
+**Multibranch Pipeline usage**
+
+When sweeping a Multibranch Pipeline, use `--branch` to build a specific branch directly instead of triggering a full scan that would kick off every branch:
 
 ```bash
-rj config-sweep folder/my-job \
+rj config-sweep PIPELINE-NAME \
     --xml-tag repository \
     --value repo-a repo-b repo-c \
+    --branch main \
     --output-dir ./results \
-    --poll-ms 3000
+    --poll-ms 1000
 ```
+
+> **Important:** target the pipeline name itself, not a branch path. `PIPELINE-NAME` — not `PIPELINE-NAME/main`.
+
+Jenkins needs a moment to apply a config change before it accepts a build request. If you get HTTP 400 errors, increase `--post-config-delay-ms` (default 3000 ms). `rj` also automatically retries up to 5 times with exponential backoff if the first attempt gets a 400.
 
 **Console output:**
 
 ```
-Fetching config.xml for 'folder/my-job'…
+Config: 'PIPELINE-NAME' — Build target: 'PIPELINE-NAME/main' (no branch scan triggered)
+Fetching config.xml for 'PIPELINE-NAME'…
 
 [1/3] <repository> = repo-a
   Config updated.
+  Waiting 3000ms for Jenkins to apply config…
   Queued as build #47
   Result: SUCCESS
-  Log:    results/my-job__repository__repo-a__#47.log
+  Log:    results/PIPELINE-NAME__main__repository__repo-a__#47.log
 
 [2/3] <repository> = repo-b
   Config updated.
+  Waiting 3000ms for Jenkins to apply config…
   Queued as build #48
   Result: SUCCESS
-  Log:    results/my-job__repository__repo-b__#48.log
-
-[3/3] <repository> = repo-c
-  Config updated.
-  Queued as build #49
-  Result: FAILURE
-  Log:    results/my-job__repository__repo-c__#49.log
+  Log:    results/PIPELINE-NAME__main__repository__repo-b__#48.log
 
 Restoring original config.xml… done.
 Config sweep complete. Logs in 'results'.
@@ -485,13 +491,17 @@ Config sweep complete. Logs in 'results'.
 |---|---|---|
 | `--xml-tag` | *(required)* | XML tag name to patch (first occurrence in the document) |
 | `--value` / `-v` | *(required)* | Values to iterate — space-separated or repeated flags |
+| `--branch` | | Build this specific branch instead of triggering a full pipeline scan. Use with Multibranch Pipelines to avoid triggering every branch. |
+| `--post-config-delay-ms` | `3000` | Wait this many ms after uploading config before triggering the build. Increase if Jenkins returns HTTP 400. |
 | `--output-dir` | `config-sweep-logs` | Directory for log files (created if absent) |
 | `--poll-ms` | `2000` | Polling interval for queue and build-complete checks |
 | `--no-restore` | | Skip restoring the original config after the sweep |
 
 The original `config.xml` is downloaded once, patched in memory for each iteration (only the target tag is changed), and restored when the sweep completes. Use `--no-restore` if you want the last value to remain.
 
-Log files follow the same naming as `sweep`: `{job}__{tag}__{value}__#{build}.log`.
+Without `--branch`, the pipeline job itself is built (triggering a branch scan). With `--branch`, only that specific branch job is built — no cascade across other branches.
+
+Log files are named `{pipeline}__{branch}__{tag}__{value}__#{build}.log` when `--branch` is used, or `{job}__{tag}__{value}__#{build}.log` otherwise.
 
 ---
 
@@ -536,7 +546,7 @@ src/
 cargo test
 ```
 
-107 tests across all modules, covering:
+109 tests across all modules, covering:
 
 - CLI argument parsing including shell-array-style multi-value flags (unit)
 - Basic Auth header attachment (wiremock)
@@ -549,4 +559,4 @@ cargo test
 - Folder/nested job path encoding: plain jobs, single folder, deep nesting, spaces in segment names (unit)
 - Folder listing: color-to-status mapping, `_anime` building detection, folder vs job class detection, root vs nested path routing (wiremock + unit)
 - Browser cookie extraction: hostname parsing, Firefox profile discovery, Chrome AES-GCM/CBC roundtrip decryption (unit)
-- Config sweep: XML tag patching (including deeply nested and first-occurrence logic), full build loop with config restore (wiremock + unit)
+- Config sweep: XML tag patching, `--branch` targeting, HTTP 400 retry with backoff, full build loop with config restore (wiremock + unit)

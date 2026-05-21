@@ -211,6 +211,12 @@ pub struct ConfigSweepArgs {
     #[arg(long)]
     pub branch: Option<String>,
 
+    /// Milliseconds to wait after uploading config before triggering the build.
+    /// Jenkins needs time to process config changes; increase this if you get
+    /// HTTP 400 errors immediately after config upload.
+    #[arg(long, default_value_t = 3000)]
+    pub post_config_delay_ms: u64,
+
     /// Skip restoring the original config.xml after the sweep completes
     #[arg(long, default_value_t = false)]
     pub no_restore: bool,
