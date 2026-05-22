@@ -329,6 +329,12 @@ fn chrome_master_key(profile: &str) -> Result<Vec<u8>> {
             .trim()
             .to_string();
 
+        eprintln!(
+            "[debug] Keychain password length: {} chars, starts with: {:?}",
+            password.len(),
+            password.chars().take(4).collect::<String>()
+        );
+
         // Derive a 16-byte AES key: PBKDF2-HMAC-SHA1(password, "saltysalt", 1003 iters)
         let mut key = vec![0u8; 16];
         pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), b"saltysalt", 1003, &mut key);
@@ -484,22 +490,37 @@ fn chrome_decrypt_cbc(encrypted: &[u8], key: &[u8]) -> Result<String> {
 
     type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
-    const PREFIX: usize = 3;
     const IV: [u8; 16] = [0x20u8; 16]; // 16 space characters
 
-    if encrypted.len() < PREFIX {
+    if encrypted.len() < 3 {
         anyhow::bail!("encrypted cookie value too short");
     }
+
+    // Show the prefix so we can see if Chrome changed format (v10 vs v11/v20).
+    let prefix = &encrypted[..3];
+    eprintln!(
+        "[debug] encrypted prefix: {:?} ({:02x}{:02x}{:02x}), total len: {}",
+        std::str::from_utf8(prefix).unwrap_or("?"),
+        prefix[0], prefix[1], prefix[2],
+        encrypted.len()
+    );
+
     let key16: &[u8; 16] = key
         .try_into()
-        .map_err(|_| anyhow::anyhow!("Chrome CBC key must be exactly 16 bytes"))?;
+        .map_err(|_| anyhow::anyhow!("Chrome CBC key must be exactly 16 bytes (got {})", key.len()))?;
 
-    let mut buf = encrypted[PREFIX..].to_vec();
+    let mut buf = encrypted[3..].to_vec();
     let decrypted = Aes128CbcDec::new(key16.into(), &IV.into())
         .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .map_err(|_| anyhow::anyhow!("AES-128-CBC decryption failed"))?;
+        .map_err(|_| anyhow::anyhow!("AES-128-CBC decryption failed (PKCS7 padding invalid — key is likely wrong)"))?;
 
-    String::from_utf8(decrypted.to_vec()).context("cookie is not valid UTF-8")
+    String::from_utf8(decrypted.to_vec()).with_context(|| {
+        format!(
+            "cookie is not valid UTF-8 — decrypted {} bytes: {:02x?}",
+            decrypted.len(),
+            &decrypted[..decrypted.len().min(16)]
+        )
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
