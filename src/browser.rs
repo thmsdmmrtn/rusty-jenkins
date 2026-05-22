@@ -329,14 +329,11 @@ fn chrome_master_key(profile: &str) -> Result<Vec<u8>> {
             .trim()
             .to_string();
 
-        eprintln!(
-            "[debug] Keychain password length: {} chars, starts with: {:?}",
-            password.len(),
-            password.chars().take(4).collect::<String>()
-        );
-
-        // Derive a 16-byte AES key: PBKDF2-HMAC-SHA1(password, "saltysalt", 1003 iters)
-        let mut key = vec![0u8; 16];
+        // Derive 48 bytes via PBKDF2-HMAC-SHA1:
+        //   [0..16]  → 16-byte CBC key  (pre-Chrome-127 AES-128-CBC scheme)
+        //   [0..32]  → 32-byte GCM key  (Chrome 127+ AES-256-GCM scheme)
+        // chrome_decrypt tries CBC first, then GCM as fallback.
+        let mut key = vec![0u8; 48];
         pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), b"saltysalt", 1003, &mut key);
         Ok(key)
     }
@@ -448,7 +445,7 @@ fn chrome_decrypt(encrypted: &[u8], key: &[u8]) -> Result<String> {
     return chrome_decrypt_gcm(encrypted, key);
 
     #[cfg(target_os = "macos")]
-    return chrome_decrypt_cbc(encrypted, key);
+    return chrome_decrypt_macos(encrypted, key);
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -457,8 +454,109 @@ fn chrome_decrypt(encrypted: &[u8], key: &[u8]) -> Result<String> {
     }
 }
 
-/// Windows: AES-256-GCM. Format: "v10"|"v20" (3 B) + nonce (12 B) + ciphertext+tag.
-#[cfg(target_os = "windows")]
+/// macOS: try every plausible decryption combination and print full hex dumps.
+#[cfg(target_os = "macos")]
+fn chrome_decrypt_macos(encrypted: &[u8], key: &[u8]) -> Result<String> {
+    // key[0..48] from PBKDF2: [0..16]=CBC key, [0..32]=GCM key
+
+    eprintln!(
+        "[debug] encrypted ({} bytes): {:02x?}",
+        encrypted.len(), encrypted
+    );
+    eprintln!("[debug] keychain-cbc-key (16B): {:02x?}", &key[..16]);
+
+    // Helper: try decrypted bytes at multiple offsets, return first valid UTF-8
+    fn try_offsets(label: &str, raw: &[u8]) -> Option<String> {
+        eprintln!("[debug] {label} raw ({} bytes): {:02x?}", raw.len(), raw);
+        for offset in [0usize, 16, 32] {
+            if raw.len() > offset {
+                match std::str::from_utf8(&raw[offset..]) {
+                    Ok(s) => {
+                        let s = s.trim_end_matches('\0').to_string();
+                        if !s.is_empty() {
+                            eprintln!("[debug] {label} offset={offset} → valid UTF-8: {s:?}");
+                            return Some(s);
+                        }
+                        eprintln!("[debug] {label} offset={offset} → valid UTF-8 but empty after trim");
+                    }
+                    Err(e) => eprintln!(
+                        "[debug] {label} offset={offset} → not UTF-8 at byte {}: {:02x?}",
+                        e.valid_up_to(), &raw[offset..]
+                    ),
+                }
+            }
+        }
+        None
+    }
+
+    // ── S1: Keychain key + fixed IV [0x20×16] ────────────────────────────────
+    match cbc_decrypt_raw_iv(encrypted, &key[..16], &[0x20u8; 16]) {
+        Ok(raw) => { if let Some(v) = try_offsets("keychain-cbc-fixed-iv", &raw) { return Ok(v); } }
+        Err(e) => eprintln!("[debug] keychain-cbc-fixed-iv failed: {e}"),
+    }
+
+    // ── S2: Keychain key + embedded IV (bytes 3..19 are the IV) ─────────────
+    // Some Chrome builds store a per-cookie IV inside the ciphertext:
+    // [v10 (3B)] [IV (16B)] [ciphertext]
+    if encrypted.len() >= 3 + 16 + 16 {
+        let embedded_iv = &encrypted[3..19];
+        let ciphertext_with_embedded_iv = [b"v10", encrypted[19..].as_ref()].concat();
+        eprintln!("[debug] embedded-iv: {:02x?}", embedded_iv);
+        match cbc_decrypt_raw_iv(&ciphertext_with_embedded_iv, &key[..16], embedded_iv) {
+            Ok(raw) => { if let Some(v) = try_offsets("keychain-cbc-embedded-iv", &raw) { return Ok(v); } }
+            Err(e) => eprintln!("[debug] keychain-cbc-embedded-iv failed: {e}"),
+        }
+    }
+
+    // ── S3: Keychain key + AES-256-GCM ───────────────────────────────────────
+    eprintln!("[debug] keychain-gcm-key (32B): {:02x?}", &key[..32]);
+    match chrome_decrypt_gcm(encrypted, &key[..32]) {
+        Ok(v) => { eprintln!("[debug] keychain-gcm → OK"); return Ok(v); }
+        Err(e) => eprintln!("[debug] keychain-gcm failed: {e}"),
+    }
+
+    // ── S4: peanuts + fixed IV ────────────────────────────────────────────────
+    let mut peanuts_key = [0u8; 16];
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(b"peanuts", b"saltysalt", 1, &mut peanuts_key);
+    eprintln!("[debug] peanuts-key: {:02x?}", peanuts_key);
+    match cbc_decrypt_raw_iv(encrypted, &peanuts_key, &[0x20u8; 16]) {
+        Ok(raw) => { if let Some(v) = try_offsets("peanuts-cbc-fixed-iv", &raw) { return Ok(v); } }
+        Err(e) => eprintln!("[debug] peanuts-cbc-fixed-iv failed: {e}"),
+    }
+
+    // ── S5: peanuts + zero IV ─────────────────────────────────────────────────
+    match cbc_decrypt_raw_iv(encrypted, &peanuts_key, &[0x00u8; 16]) {
+        Ok(raw) => { if let Some(v) = try_offsets("peanuts-cbc-zero-iv", &raw) { return Ok(v); } }
+        Err(e) => eprintln!("[debug] peanuts-cbc-zero-iv failed: {e}"),
+    }
+
+    anyhow::bail!("all macOS decryption strategies failed — see [debug] lines above")
+}
+
+/// Raw AES-128-CBC with an explicit IV (no UTF-8 check, returns raw plaintext bytes).
+#[cfg(target_os = "macos")]
+fn cbc_decrypt_raw_iv(encrypted: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
+    use aes::Aes128;
+    use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+    type Aes128CbcDec = cbc::Decryptor<Aes128>;
+
+    if encrypted.len() < 3 { anyhow::bail!("too short"); }
+    let key16: &[u8; 16] = key.try_into()
+        .map_err(|_| anyhow::anyhow!("key must be 16 bytes (got {})", key.len()))?;
+    let iv16: &[u8; 16] = iv.try_into()
+        .map_err(|_| anyhow::anyhow!("IV must be 16 bytes"))?;
+    let mut buf = encrypted[3..].to_vec();
+    let out = Aes128CbcDec::new(key16.into(), iv16.into())
+        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .map_err(|_| anyhow::anyhow!("PKCS7 failed"))?;
+    Ok(out.to_vec())
+}
+
+
+/// AES-256-GCM. Format: "v10"|"v20" (3 B) + nonce (12 B) + ciphertext+tag.
+/// Used on Windows always; used on macOS as fallback for Chrome 127+ which
+/// switched from AES-128-CBC to AES-256-GCM while keeping the "v10" prefix.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn chrome_decrypt_gcm(encrypted: &[u8], key: &[u8]) -> Result<String> {
     use aes_gcm::{
         aead::{Aead, KeyInit},
@@ -496,31 +594,17 @@ fn chrome_decrypt_cbc(encrypted: &[u8], key: &[u8]) -> Result<String> {
         anyhow::bail!("encrypted cookie value too short");
     }
 
-    // Show the prefix so we can see if Chrome changed format (v10 vs v11/v20).
-    let prefix = &encrypted[..3];
-    eprintln!(
-        "[debug] encrypted prefix: {:?} ({:02x}{:02x}{:02x}), total len: {}",
-        std::str::from_utf8(prefix).unwrap_or("?"),
-        prefix[0], prefix[1], prefix[2],
-        encrypted.len()
-    );
-
     let key16: &[u8; 16] = key
         .try_into()
-        .map_err(|_| anyhow::anyhow!("Chrome CBC key must be exactly 16 bytes (got {})", key.len()))?;
+        .map_err(|_| anyhow::anyhow!("CBC key must be 16 bytes (got {})", key.len()))?;
 
     let mut buf = encrypted[3..].to_vec();
     let decrypted = Aes128CbcDec::new(key16.into(), &IV.into())
         .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .map_err(|_| anyhow::anyhow!("AES-128-CBC decryption failed (PKCS7 padding invalid — key is likely wrong)"))?;
+        .map_err(|_| anyhow::anyhow!("AES-128-CBC PKCS7 decryption failed"))?;
 
-    String::from_utf8(decrypted.to_vec()).with_context(|| {
-        format!(
-            "cookie is not valid UTF-8 — decrypted {} bytes: {:02x?}",
-            decrypted.len(),
-            &decrypted[..decrypted.len().min(16)]
-        )
-    })
+    String::from_utf8(decrypted.to_vec())
+        .context("cookie is not valid UTF-8")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
