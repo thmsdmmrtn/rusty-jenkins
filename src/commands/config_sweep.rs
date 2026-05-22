@@ -105,10 +105,11 @@ pub async fn run(client: &JenkinsClient, args: &ConfigSweepArgs) -> Result<()> {
             println!("  Scanning parent pipeline to index new repository…");
             match run_scan(client, &args.job, args.poll_ms).await {
                 Ok(()) => println!("  Scan complete."),
-                Err(e) => {
-                    eprintln!("  Scan failed: {e:#}. Attempting branch build anyway…");
-                }
+                Err(e) => eprintln!("  Scan failed: {e:#}. Attempting branch build anyway…"),
             }
+            // Brief settling delay — Jenkins needs a moment after indexing
+            // to mark branch jobs as buildable before accepting a build request.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
 
         // 3b. Trigger a build on the target (branch job or parent pipeline)
@@ -257,50 +258,67 @@ async fn upload_config(client: &JenkinsClient, job: &str, xml: &str) -> Result<(
     Ok(())
 }
 
+/// Try `/build`, then immediately `/buildWithParameters` on the same attempt if
+/// that returns 400. Multibranch pipeline branches in CloudBees CI sometimes
+/// only accept `buildWithParameters` even for jobs with no parameters.
+/// Retries up to 5 attempts with exponential backoff between attempts.
 async fn trigger_build(client: &JenkinsClient, job: &str, poll_ms: u64) -> Result<u64> {
-    // Retry up to 5 times with exponential backoff on HTTP 400.
-    // Jenkins sometimes returns 400 immediately after a config change while it
-    // is still applying the new configuration internally.
     const MAX_ATTEMPTS: u32 = 5;
     let mut delay_ms = 2_000u64;
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let resp = client
-            .post(&format!("job/{}/build", encode_job_path(job)))
-            .await?
-            .form(&Vec::<(String, String)>::new())
-            .send()
-            .await
-            .context("triggering build")?;
+        for endpoint in ["build", "buildWithParameters"] {
+            let resp = client
+                .post(&format!("job/{}/{endpoint}", encode_job_path(job)))
+                .await?
+                .form(&Vec::<(String, String)>::new())
+                .send()
+                .await
+                .with_context(|| format!("triggering build via /{endpoint}"))?;
 
-        let status = resp.status();
+            let status = resp.status();
 
-        if status == 400 && attempt < MAX_ATTEMPTS {
-            eprintln!(
-                "  HTTP 400 on attempt {attempt}/{MAX_ATTEMPTS} — \
-                 Jenkins may still be indexing. Retrying in {delay_ms}ms…"
-            );
+            if status == 400 {
+                let body = resp.text().await.unwrap_or_default();
+                let body_preview = body.lines().next().unwrap_or("(empty)");
+                eprintln!(
+                    "  HTTP 400 via /{endpoint} (attempt {attempt}/{MAX_ATTEMPTS}): {body_preview}"
+                );
+                // Try the other endpoint within this attempt before giving up.
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                let body_preview = body.lines().next().unwrap_or("(empty)");
+                anyhow::bail!(
+                    "Jenkins returned HTTP {status} via /{endpoint}: {body_preview}"
+                );
+            }
+
+            let location = resp
+                .headers()
+                .get("Location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("no Location header in build response"))?
+                .to_string();
+
+            let queue_id = extract_queue_id(&location)?;
+            return poll_queue(client, queue_id, poll_ms).await;
+        }
+
+        // Both endpoints returned 400 this attempt — wait then retry.
+        if attempt < MAX_ATTEMPTS {
+            eprintln!("  Both endpoints returned 400. Retrying in {delay_ms}ms…");
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             delay_ms *= 2;
-            continue;
         }
-
-        if !status.is_success() {
-            anyhow::bail!("Jenkins returned HTTP {status} triggering build");
-        }
-
-        let location = resp
-            .headers()
-            .get("Location")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| anyhow::anyhow!("no Location header in build response"))?
-            .to_string();
-
-        let queue_id = extract_queue_id(&location)?;
-        return poll_queue(client, queue_id, poll_ms).await;
     }
 
-    anyhow::bail!("build trigger failed after {MAX_ATTEMPTS} attempts")
+    anyhow::bail!(
+        "build trigger failed after {MAX_ATTEMPTS} attempts on both /build and \
+         /buildWithParameters — check the 400 messages above for Jenkins' reason"
+    )
 }
 
 async fn save_log(client: &JenkinsClient, job: &str, build: u64, path: &Path) -> Result<()> {
@@ -635,7 +653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trigger_build_retries_on_400_then_succeeds() {
+    async fn trigger_build_falls_back_to_build_with_parameters_on_400() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -644,16 +662,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        // First two attempts return 400, third succeeds
+        // /build always returns 400
         Mock::given(method("POST"))
             .and(path("/job/my-job/build"))
             .respond_with(ResponseTemplate::new(400))
-            .up_to_n_times(2)
             .mount(&server)
             .await;
 
+        // /buildWithParameters succeeds on first try
         Mock::given(method("POST"))
-            .and(path("/job/my-job/build"))
+            .and(path("/job/my-job/buildWithParameters"))
             .respond_with(
                 ResponseTemplate::new(201)
                     .append_header("Location", format!("{}/queue/item/1/", server.uri())),
@@ -671,9 +689,56 @@ mod tests {
             .await;
 
         let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
-        // Use 0ms delay so the test runs instantly
         let build_num = trigger_build(&client, "my-job", 0).await.unwrap();
         assert_eq!(build_num, 5);
+    }
+
+    #[tokio::test]
+    async fn trigger_build_retries_across_attempts_when_both_endpoints_fail() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/crumbIssuer/api/json"))
+            .respond_with(crumb())
+            .mount(&server)
+            .await;
+
+        // Both endpoints return 400 for the first attempt, then /build succeeds
+        Mock::given(method("POST"))
+            .and(path("/job/my-job/build"))
+            .respond_with(ResponseTemplate::new(400))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/job/my-job/buildWithParameters"))
+            .respond_with(ResponseTemplate::new(400))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/job/my-job/build"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .append_header("Location", format!("{}/queue/item/2/", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/queue/item/2/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                "executable": { "number": 7, "url": "http://x" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
+        let build_num = trigger_build(&client, "my-job", 0).await.unwrap();
+        assert_eq!(build_num, 7);
     }
 
     #[tokio::test]
