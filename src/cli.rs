@@ -72,6 +72,14 @@ pub enum Command {
     /// Patch an XML tag in a job's config, trigger a build for each value,
     /// wait for completion, save the log, then restore the original config
     ConfigSweep(ConfigSweepArgs),
+
+    /// Read the value of an XML tag from the config of each job in a folder
+    /// or explicit list — e.g. show which branch every pipeline is set to
+    ListTag(ListTagArgs),
+
+    /// Set an XML tag in the config of each job in a folder or explicit list
+    /// without triggering builds or restoring the original config
+    PatchTag(PatchTagArgs),
 }
 
 // ── inspect ──────────────────────────────────────────────────────────────────
@@ -227,6 +235,51 @@ pub struct ConfigSweepArgs {
     /// Skip restoring the original config.xml after the sweep completes
     #[arg(long, default_value_t = false)]
     pub no_restore: bool,
+}
+
+// ── list-tag / patch-tag ──────────────────────────────────────────────────────
+
+/// Shared job targeting — use one or both flags together.
+#[derive(Debug, Args)]
+pub struct JobTarget {
+    /// Folder path: operate on every direct job child (non-recursive).
+    /// e.g. --path folder/subfolder
+    #[arg(long)]
+    pub path: Option<String>,
+
+    /// Specific job(s) to target (repeatable).
+    /// e.g. --job-name folder/job1 --job-name folder/job2
+    #[arg(long = "job-name")]
+    pub job_names: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ListTagArgs {
+    #[command(flatten)]
+    pub target: JobTarget,
+
+    /// XML tag whose value to read from each job's config.xml
+    #[arg(long)]
+    pub xml_tag: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PatchTagArgs {
+    #[command(flatten)]
+    pub target: JobTarget,
+
+    /// XML tag to update in each job's config.xml
+    #[arg(long)]
+    pub xml_tag: String,
+
+    /// Value to set
+    #[arg(long)]
+    pub value: String,
+
+    /// Show the existing value before the new one — useful for auditing or
+    /// catching accidental changes: `<tag>: old-value → new-value`
+    #[arg(long, default_value_t = false)]
+    pub show_old: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

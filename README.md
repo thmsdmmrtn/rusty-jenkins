@@ -13,6 +13,8 @@ A modular, async Rust CLI for the Jenkins REST API.
 | `config set` | Upload a local `config.xml` to replace a job's configuration |
 | `sweep` | Run a job repeatedly, varying one parameter each time, and save each build's log |
 | `config-sweep` | Patch an XML tag in a job's config for each value, trigger a build, save the log, then restore |
+| `list-tag` | Read the value of an XML tag from every job in a folder or explicit list |
+| `patch-tag` | Set an XML tag in every job in a folder or explicit list — no build, no restore |
 | `list` | List the jobs and sub-folders inside a folder (or the root) |
 
 All commands handle Basic Auth and Jenkins CSRF crumbs automatically.
@@ -505,6 +507,117 @@ Log files are named `{pipeline}__{branch}__{tag}__{value}__#{build}.log` when `-
 
 ---
 
+### `list-tag`
+
+Read the value of an XML tag from every job in a folder or an explicit list. Useful for auditing configuration across many jobs at once — for example, checking which branch each pipeline is set to.
+
+```bash
+# Every job in a folder
+rj list-tag --path folder/subfolder --xml-tag repository
+
+# Specific jobs only
+rj list-tag --job-name folder/job1 --job-name folder/job3 --xml-tag repository
+
+# Both — combine a folder scan with extra individual jobs
+rj list-tag --path folder --job-name other-folder/special-job --xml-tag repository
+```
+
+**Example output:**
+
+```
+folder/job1:s3
+folder/job2:deep-clear
+folder/job3:main
+```
+
+If a job's config does not contain the tag, the line reads `(tag <name> not found)`. Errors on individual jobs are printed and the loop continues.
+
+| Flag | Description |
+|---|---|
+| `--path` | Folder to scan — all direct (non-folder) job children are included |
+| `--job-name` | Specific job path (repeatable) |
+| `--xml-tag` | XML tag whose text content to read |
+
+---
+
+### `patch-tag`
+
+Set the value of an XML tag in every job in a folder or explicit list. Unlike `config-sweep`, this does not trigger a build and does not restore the original config — the change is permanent.
+
+```bash
+# Set the branch for every job in a folder
+rj patch-tag --path folder/subfolder --xml-tag branches/name --value "*/develop"
+
+# Only specific jobs
+rj patch-tag --job-name folder/job1 --job-name folder/job3 --xml-tag branches/name --value "*/s3"
+
+# Show the existing value before the new one for easy auditing
+rj patch-tag --path folder --xml-tag branches/name --value "*/develop" --show-old
+```
+
+**Example output (with `--show-old`):**
+
+```
+[1/3] folder/job1 … <branches/name>: */main → */develop
+[2/3] folder/job2 … <branches/name>: */staging → */develop
+[3/3] folder/job3 … <branches/name>: */develop → */develop
+```
+
+**Example output (without `--show-old`):**
+
+```
+[1/3] folder/job1 … <branches/name> → */develop
+[2/3] folder/job2 … <branches/name> → */develop
+[3/3] folder/job3 … <branches/name> → */develop
+```
+
+Failures on individual jobs are printed and the loop continues to the remaining jobs.
+
+| Flag | Description |
+|---|---|
+| `--path` | Folder to scan — all direct (non-folder) job children are included |
+| `--job-name` | Specific job path (repeatable) |
+| `--xml-tag` | XML tag to update (supports `/`-separated paths — see below) |
+| `--value` | New value to set |
+| `--show-old` | Print the existing value before the new one |
+
+> Sub-folders inside `--path` are skipped — only direct job children are targeted, preventing accidental mass updates across deeply nested structures.
+
+---
+
+### XML tag paths
+
+Both `list-tag` and `patch-tag` accept a `/`-separated path for `--xml-tag` to disambiguate when multiple elements share the same tag name. Each segment is found by depth-first search within the match of the previous segment.
+
+**Example — a pipeline config with two `<name>` elements:**
+
+```xml
+<properties>
+  <hudson.model.StringParameterDefinition>
+    <name>FOOBAR</name>          ← parameter name
+  </hudson.model.StringParameterDefinition>
+</properties>
+<definition>
+  <scm>
+    <branches>
+      <hudson.plugins.git.BranchSpec>
+        <name>*/main</name>      ← branch name
+      </hudson.plugins.git.BranchSpec>
+    </branches>
+  </scm>
+</definition>
+```
+
+| `--xml-tag` value | Resolves to |
+|---|---|
+| `name` | `FOOBAR` (first `<name>` in depth-first order) |
+| `branches/name` | `*/main` (first `<name>` inside `<branches>`) |
+| `hudson.plugins.git.BranchSpec/name` | `*/main` (more specific ancestor) |
+
+Element names containing dots work as-is — the `/` is the only separator.
+
+---
+
 ## Architecture
 
 ```
@@ -519,6 +632,8 @@ src/
     ├── logs.rs          # Async progressive-text polling loop
     ├── config.rs        # XML config GET and POST
     ├── config_sweep.rs  # XML-patch loop: patch config, build, wait, save log, restore
+    ├── list_tag.rs      # Read an XML tag value across a folder or job list
+    ├── patch_tag.rs     # Set an XML tag value across a folder or job list
     ├── sweep.rs         # Build-param loop: queue polling, build-wait, log saving
     └── list.rs          # Folder contents listing with status and building indicator
 ```
@@ -546,7 +661,7 @@ src/
 cargo test
 ```
 
-109 tests across all modules, covering:
+122 tests across all modules, covering:
 
 - CLI argument parsing including shell-array-style multi-value flags (unit)
 - Basic Auth header attachment (wiremock)
@@ -560,3 +675,4 @@ cargo test
 - Folder listing: color-to-status mapping, `_anime` building detection, folder vs job class detection, root vs nested path routing (wiremock + unit)
 - Browser cookie extraction: hostname parsing, Firefox profile discovery, Chrome AES-GCM/CBC roundtrip decryption (unit)
 - Config sweep: XML tag patching, `--branch` targeting, HTTP 400 retry with backoff, full build loop with config restore (wiremock + unit)
+- `list-tag` / `patch-tag`: folder-to-job resolution, XML tag read/write, per-job error isolation (wiremock + unit)

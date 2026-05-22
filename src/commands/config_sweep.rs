@@ -5,18 +5,34 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use xmltree::{Element, XMLNode};
 
-// ── XML patching ──────────────────────────────────────────────────────────────
+// ── XML path helpers ─────────────────────────────────────────────────────────
+//
+// Tag paths use `/` to navigate: "branches/name" finds the first <name> that
+// is a descendant of the first <branches>, anywhere in the tree.
+// Single-segment names keep the original any-depth depth-first behaviour.
+//
+// Examples for the Jenkins pipeline config XML:
+//   "name"           → first <name> anywhere       (could be a param name)
+//   "branches/name"  → <name> inside <branches>    (the branch spec)
+//   "BranchSpec/name"→ <name> inside <...BranchSpec>
 
-/// Find the first element with `tag_name` anywhere in the tree and replace its
-/// text content with `new_value`. Returns `true` if the tag was found.
-pub fn patch_xml_tag(xml: &str, tag_name: &str, new_value: &str) -> Result<String> {
-    let mut root =
-        Element::parse(xml.as_bytes()).context("parsing config.xml")?;
+/// Read the text of the first element matching `tag_path`.
+pub fn read_xml_tag(xml: &str, tag_path: &str) -> Result<Option<String>> {
+    let root = Element::parse(xml.as_bytes()).context("parsing config.xml")?;
+    let segs: Vec<&str> = tag_path.split('/').collect();
+    Ok(find_by_path(&root, &segs))
+}
 
-    if !replace_first(&mut root, tag_name, new_value) {
+/// Patch the text of the first element matching `tag_path`.
+pub fn patch_xml_tag(xml: &str, tag_path: &str, new_value: &str) -> Result<String> {
+    let mut root = Element::parse(xml.as_bytes()).context("parsing config.xml")?;
+    let segs: Vec<&str> = tag_path.split('/').collect();
+
+    if !replace_by_path(&mut root, &segs, new_value) {
         anyhow::bail!(
-            "XML tag <{tag_name}> not found in config.xml.\n\
-             Tip: use `rj config get <job>` to inspect the XML and find the correct tag name."
+            "XML path <{tag_path}> not found in config.xml.\n\
+             Tip: use `rj config get <job>` to inspect the XML and find the correct path.\n\
+             Use / to disambiguate: e.g. `branches/name` instead of just `name`."
         );
     }
 
@@ -25,18 +41,74 @@ pub fn patch_xml_tag(xml: &str, tag_name: &str, new_value: &str) -> Result<Strin
     String::from_utf8(buf).context("config.xml is not valid UTF-8 after patching")
 }
 
-/// Depth-first search: set the text of the first element named `tag`.
+// ── Path-based tree traversal ─────────────────────────────────────────────────
+
+/// Navigate a `/`-separated path. Each segment is located by DFS within the
+/// match of the previous segment. Single-segment = any-depth DFS (original behaviour).
+fn find_by_path(el: &Element, path: &[&str]) -> Option<String> {
+    match path {
+        [] => None,
+        [tag] => dfs_text(el, tag),
+        [head, rest @ ..] => dfs_then_path(el, head, rest),
+    }
+}
+
+/// DFS for the first element named `head`; once found, continue with `rest`.
+fn dfs_then_path(el: &Element, head: &str, rest: &[&str]) -> Option<String> {
+    if el.name == head {
+        return find_by_path(el, rest);
+    }
+    for child in &el.children {
+        if let XMLNode::Element(c) = child {
+            if let Some(v) = dfs_then_path(c, head, rest) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// DFS for the first element named `tag`; return its text content.
+fn dfs_text(el: &Element, tag: &str) -> Option<String> {
+    if el.name == tag {
+        let t: String = el.children.iter()
+            .filter_map(|n| if let XMLNode::Text(t) = n { Some(t.as_str()) } else { None })
+            .collect();
+        return Some(t);
+    }
+    for child in &el.children {
+        if let XMLNode::Element(c) = child { if let Some(v) = dfs_text(c, tag) { return Some(v); } }
+    }
+    None
+}
+
+fn replace_by_path(el: &mut Element, path: &[&str], value: &str) -> bool {
+    match path {
+        [] => false,
+        [tag] => replace_first(el, tag, value),
+        [head, rest @ ..] => replace_dfs_then_path(el, head, rest, value),
+    }
+}
+
+fn replace_dfs_then_path(el: &mut Element, head: &str, rest: &[&str], value: &str) -> bool {
+    if el.name == head {
+        return replace_by_path(el, rest, value);
+    }
+    for child in &mut el.children {
+        if let XMLNode::Element(c) = child {
+            if replace_dfs_then_path(c, head, rest, value) { return true; }
+        }
+    }
+    false
+}
+
 fn replace_first(el: &mut Element, tag: &str, value: &str) -> bool {
     if el.name == tag {
         el.children = vec![XMLNode::Text(value.to_string())];
         return true;
     }
     for child in &mut el.children {
-        if let XMLNode::Element(child_el) = child {
-            if replace_first(child_el, tag, value) {
-                return true;
-            }
-        }
+        if let XMLNode::Element(c) = child { if replace_first(c, tag, value) { return true; } }
     }
     false
 }
@@ -367,6 +439,65 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(&serde_json::json!({
             "crumb": "tok", "crumbRequestField": "Jenkins-Crumb"
         }))
+    }
+
+    // ── path syntax ───────────────────────────────────────────────────────────
+
+    // XML that has two <name> tags — one for a param, one for a branch spec.
+    const AMBIGUOUS_XML: &str = r#"<flow-definition>
+      <properties>
+        <hudson.model.ParametersDefinitionProperty>
+          <parameterDefinitions>
+            <hudson.model.StringParameterDefinition>
+              <name>FOOBAR</name>
+            </hudson.model.StringParameterDefinition>
+          </parameterDefinitions>
+        </hudson.model.ParametersDefinitionProperty>
+      </properties>
+      <definition>
+        <scm>
+          <branches>
+            <hudson.plugins.git.BranchSpec>
+              <name>*/main</name>
+            </hudson.plugins.git.BranchSpec>
+          </branches>
+        </scm>
+      </definition>
+    </flow-definition>"#;
+
+    #[test]
+    fn single_segment_finds_first_occurrence() {
+        // Without a path, DFS picks up "FOOBAR" first.
+        assert_eq!(read_xml_tag(AMBIGUOUS_XML, "name").unwrap(), Some("FOOBAR".into()));
+    }
+
+    #[test]
+    fn path_branches_name_finds_branch_spec() {
+        assert_eq!(
+            read_xml_tag(AMBIGUOUS_XML, "branches/name").unwrap(),
+            Some("*/main".into())
+        );
+    }
+
+    #[test]
+    fn path_branchspec_name_finds_branch_spec() {
+        assert_eq!(
+            read_xml_tag(AMBIGUOUS_XML, "hudson.plugins.git.BranchSpec/name").unwrap(),
+            Some("*/main".into())
+        );
+    }
+
+    #[test]
+    fn path_patch_changes_correct_name_tag() {
+        let patched = patch_xml_tag(AMBIGUOUS_XML, "branches/name", "*/develop").unwrap();
+        assert!(patched.contains("*/develop"));
+        assert!(patched.contains("<name>FOOBAR</name>")); // param name untouched
+    }
+
+    #[test]
+    fn path_error_message_includes_the_path() {
+        let err = patch_xml_tag(AMBIGUOUS_XML, "missing/tag", "x").unwrap_err();
+        assert!(err.to_string().contains("missing/tag"));
     }
 
     // ── patch_xml_tag ─────────────────────────────────────────────────────────

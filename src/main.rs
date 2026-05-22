@@ -53,6 +53,8 @@ async fn run() -> Result<()> {
         Some(Command::Sweep(args))   => commands::sweep::run(&client, args).await,
         Some(Command::List(args))        => commands::list::run(&client, args).await,
         Some(Command::ConfigSweep(args)) => commands::config_sweep::run(&client, args).await,
+        Some(Command::ListTag(args))     => commands::list_tag::run(&client, args).await,
+        Some(Command::PatchTag(args))    => commands::patch_tag::run(&client, args).await,
         None => {
             // No subcommand and --list-cookies was already handled above.
             // Print help so the user knows what's available.
