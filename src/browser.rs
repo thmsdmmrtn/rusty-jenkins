@@ -190,7 +190,7 @@ pub fn parse_default_profile(ini: &str) -> Option<String> {
 }
 
 fn query_firefox_cookies(db_path: &Path, hostname: &str) -> Result<String> {
-    let tmp = temp_copy(db_path)?;
+    let tmp = try_copy_db(db_path)?;
     let conn = Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .context("opening Firefox cookie database")?;
 
@@ -344,9 +344,7 @@ fn chrome_master_key(profile: &str) -> Result<Vec<u8>> {
 }
 
 fn query_chrome_cookies(db_path: &Path, hostname: &str, master_key: &[u8]) -> Result<String> {
-    let tmp = temp_copy(db_path)?;
-    let conn = Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .context("opening Chrome cookie database")?;
+    let conn = open_chrome_db(db_path)?;
 
     // Chrome expiry is microseconds since 1601-01-01; session cookies are 0.
     // Convert Unix now → Chrome epoch: add the 369-year offset in µs.
@@ -397,13 +395,12 @@ fn query_chrome_cookies(db_path: &Path, hostname: &str, master_key: &[u8]) -> Re
         })
         .collect();
 
-    std::fs::remove_file(&tmp).ok();
     require_nonempty(cookies, hostname)
 }
 
 /// Decrypt a single Chrome cookie value — dispatches to the right algorithm per OS.
 fn cookie_names_firefox(db_path: &Path, hostname: &str) -> Result<Vec<String>> {
-    let tmp = temp_copy(db_path)?;
+    let tmp = try_copy_db(db_path)?;
     let conn = Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let now = unix_now_secs() as i64;
     let mut stmt = conn.prepare(
@@ -420,8 +417,7 @@ fn cookie_names_firefox(db_path: &Path, hostname: &str) -> Result<Vec<String>> {
 }
 
 fn cookie_names_chrome(db_path: &Path, hostname: &str, master_key: &[u8]) -> Result<Vec<String>> {
-    let tmp = temp_copy(db_path)?;
-    let conn = Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = open_chrome_db(db_path)?;
     let chrome_now = unix_now_secs() * 1_000_000 + 11_644_473_600_000_000u64;
     let mut stmt = conn.prepare(
         "SELECT name FROM cookies
@@ -437,10 +433,7 @@ fn cookie_names_chrome(db_path: &Path, hostname: &str, master_key: &[u8]) -> Res
         .filter_map(|r| r.ok())
         // Only list names we can actually use (have a value, encrypted or plain)
         .collect();
-    // Also check for any cookies we'd skip due to decryption — show those too
-    // (we query names-only here so no decryption needed)
-    let _ = master_key;
-    std::fs::remove_file(&tmp).ok();
+    let _ = master_key; // names-only query, no decryption needed
     Ok(names)
 }
 
@@ -582,29 +575,98 @@ mod dpapi {
 // Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn temp_copy(src: &Path) -> Result<PathBuf> {
-    let dst = std::env::temp_dir().join("rj_browser_cookies.sqlite");
-    std::fs::copy(src, &dst)
-        .with_context(|| format!("copying cookie database from '{}'", src.display()))?;
-
-    // Chrome uses SQLite WAL mode: recent writes land in `cookies.sqlite-wal`
-    // and are only merged into the main file during a checkpoint. If we copy
-    // just the main file we get a stale snapshot that misses your new session
-    // cookies. Copy the WAL and SHM auxiliary files too so SQLite sees the
-    // full current state.
-    let src_str = src.as_os_str();
-    for suffix in ["-wal", "-shm"] {
-        let mut aux = src_str.to_owned();
-        aux.push(suffix);
-        let src_aux = Path::new(&aux);
-        if src_aux.exists() {
-            let mut dst_aux_str = dst.as_os_str().to_owned();
-            dst_aux_str.push(suffix);
-            std::fs::copy(src_aux, Path::new(&dst_aux_str)).ok();
-        }
+/// Open the Chrome cookie database, returning a connection.
+/// Tries three strategies in order:
+///   1. Open the original file directly via SQLite (SQLite uses different
+///      internal flags than std::fs and may succeed where a file copy fails).
+///   2. Copy with FILE_SHARE_* flags and open the copy.
+///   3. Plain copy (works when Chrome is closed).
+/// If all strategies fail on Windows with a sharing violation, surfaces a
+/// clear error explaining how to work around Chrome's exclusive lock.
+fn open_chrome_db(db_path: &Path) -> Result<Connection> {
+    // Strategy 1: direct SQLite open on the original path.
+    // SQLite in read-only mode acquires only a shared lock and uses internal
+    // CreateFile flags that sometimes bypass Chrome's sharing restrictions.
+    if let Ok(conn) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        return Ok(conn);
     }
 
+    // Strategy 2 & 3: copy then open.
+    match try_copy_db(db_path) {
+        Ok(tmp) => {
+            let conn = Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .context("opening copied Chrome cookie database")?;
+            Ok(conn)
+        }
+        Err(e) => {
+            // Check the full error chain for a Windows sharing violation (os error 32).
+            // e.to_string() only returns the top-level context message; we need
+            // format!("{e:#}") to see all layers including the inner OS error.
+            let full = format!("{e:#}");
+            if full.contains("os error 32") || full.contains("being used by another process") {
+                anyhow::bail!(
+                    "Chrome has its cookie database locked (this is a security feature in \
+                     modern Chrome on Windows).\n\
+                     \n\
+                     Work-arounds:\n\
+                     \n\
+                     Option A — close Chrome, run rj, reopen Chrome:\n\
+                     \n\
+                     Option B — copy the cookie from Chrome DevTools:\n\
+                       1. Press F12 in Chrome\n\
+                       2. Application tab → Cookies → your Jenkins URL\n\
+                       3. Find JSESSIONID.* and copy its value\n\
+                       4. Run:  $env:JENKINS_COOKIE = \"JSESSIONID.xxx=<value>\"\n\
+                          Then: rj list"
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+fn try_copy_db(src: &Path) -> Result<PathBuf> {
+    let dst = std::env::temp_dir().join("rj_browser_cookies.sqlite");
+    copy_file_shared(src, &dst)
+        .with_context(|| format!("copying cookie database from '{}'", src.display()))?;
+
+    // Copy WAL and SHM auxiliary files so SQLite sees un-checkpointed writes.
+    let src_str = src.as_os_str();
+    for suffix in ["-wal", "-shm"] {
+        let mut aux_src = src_str.to_owned();
+        aux_src.push(suffix);
+        let src_aux = Path::new(&aux_src);
+        if src_aux.exists() {
+            let mut aux_dst = dst.as_os_str().to_owned();
+            aux_dst.push(suffix);
+            copy_file_shared(src_aux, Path::new(&aux_dst)).ok();
+        }
+    }
     Ok(dst)
+}
+
+/// Copy a file that may be held open by another process.
+/// On Windows uses FILE_SHARE_READ|WRITE|DELETE; falls back to plain copy elsewhere.
+fn copy_file_shared(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::{Read, Write};
+        use std::os::windows::fs::OpenOptionsExt;
+        const SHARE_ALL: u32 = 0x0000_0007; // READ | WRITE | DELETE
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(SHARE_ALL)
+            .open(src)?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        std::fs::File::create(dst)?.write_all(&buf)?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::fs::copy(src, dst)?;
+        Ok(())
+    }
 }
 
 fn unix_now_secs() -> u64 {
