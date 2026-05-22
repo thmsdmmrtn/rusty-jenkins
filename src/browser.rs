@@ -376,14 +376,24 @@ fn query_chrome_cookies(db_path: &Path, hostname: &str, master_key: &[u8]) -> Re
         .context("querying Chrome cookies")?
         .filter_map(|r| r.ok())
         .filter_map(|(name, plaintext, enc)| {
-            let value = if !plaintext.is_empty() {
-                plaintext
-            } else if !enc.is_empty() && !master_key.is_empty() {
-                chrome_decrypt(&enc, master_key).ok()?
-            } else {
+            if !plaintext.is_empty() {
+                return Some(format!("{name}={plaintext}"));
+            }
+            if enc.is_empty() {
+                eprintln!("  [debug] {name}: both value and encrypted_value are empty — skipping");
                 return None;
-            };
-            Some(format!("{name}={value}"))
+            }
+            if master_key.is_empty() {
+                eprintln!("  [debug] {name}: no master key available — skipping");
+                return None;
+            }
+            match chrome_decrypt(&enc, master_key) {
+                Ok(v) => Some(format!("{name}={v}")),
+                Err(e) => {
+                    eprintln!("  [debug] {name}: decryption failed — {e}");
+                    None
+                }
+            }
         })
         .collect();
 
@@ -576,6 +586,24 @@ fn temp_copy(src: &Path) -> Result<PathBuf> {
     let dst = std::env::temp_dir().join("rj_browser_cookies.sqlite");
     std::fs::copy(src, &dst)
         .with_context(|| format!("copying cookie database from '{}'", src.display()))?;
+
+    // Chrome uses SQLite WAL mode: recent writes land in `cookies.sqlite-wal`
+    // and are only merged into the main file during a checkpoint. If we copy
+    // just the main file we get a stale snapshot that misses your new session
+    // cookies. Copy the WAL and SHM auxiliary files too so SQLite sees the
+    // full current state.
+    let src_str = src.as_os_str();
+    for suffix in ["-wal", "-shm"] {
+        let mut aux = src_str.to_owned();
+        aux.push(suffix);
+        let src_aux = Path::new(&aux);
+        if src_aux.exists() {
+            let mut dst_aux_str = dst.as_os_str().to_owned();
+            dst_aux_str.push(suffix);
+            std::fs::copy(src_aux, Path::new(&dst_aux_str)).ok();
+        }
+    }
+
     Ok(dst)
 }
 
