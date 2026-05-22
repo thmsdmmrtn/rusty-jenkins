@@ -22,33 +22,33 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    if cli.url.is_empty() {
-        anyhow::bail!(
+    let url = cli.url.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
             "Jenkins URL is required. Set the JENKINS_URL environment variable or pass --url <URL>."
-        );
-    }
+        )
+    })?;
 
     // Diagnostic: list cookie names found in the browser, then exit.
     if cli.list_cookies {
         let browser = if cli.from_chrome { "chrome" } else { "firefox" };
-        return browser::list_cookie_names(&cli.url, browser, &cli.chrome_profile);
+        return browser::list_cookie_names(url, browser, &cli.chrome_profile);
     }
 
     // Resolve authentication: explicit cookie > --from-chrome > --from-firefox > Basic Auth
     let client = if let Some(cookie) = &cli.cookie {
-        JenkinsClient::new_with_cookie(&cli.url, cookie)
+        JenkinsClient::new_with_cookie(url, cookie)
     } else if cli.from_chrome {
-        let cookie = browser::chrome_cookies(&cli.url, &cli.chrome_profile)
+        let cookie = browser::chrome_cookies(url, &cli.chrome_profile)
             .context("reading session cookies from Chrome")?;
         eprintln!("Using Chrome session cookies for authentication.");
-        JenkinsClient::new_with_cookie(&cli.url, cookie)
+        JenkinsClient::new_with_cookie(url, cookie)
     } else if cli.from_firefox {
-        let cookie = browser::firefox_cookies(&cli.url)
+        let cookie = browser::firefox_cookies(url)
             .context("reading session cookies from Firefox")?;
         eprintln!("Using Firefox session cookies for authentication.");
-        JenkinsClient::new_with_cookie(&cli.url, cookie)
+        JenkinsClient::new_with_cookie(url, cookie)
     } else {
-        JenkinsClient::new(&cli.url, &cli.user, &cli.token)
+        JenkinsClient::new(url, &cli.user, &cli.token)
     };
 
     match &cli.command {

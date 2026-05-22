@@ -5,8 +5,8 @@ use clap::{Args, Parser, Subcommand};
 #[command(name = "rj", version, about, long_about = None)]
 pub struct Cli {
     /// Jenkins base URL (e.g. http://jenkins.example.com:8080)
-    #[arg(long, global = true, env = "JENKINS_URL", default_value = "")]
-    pub url: String,
+    #[arg(long, global = true, env = "JENKINS_URL")]
+    pub url: Option<String>,
 
     /// Jenkins username
     #[arg(long, global = true, env = "JENKINS_USER", default_value = "admin")]
@@ -320,7 +320,7 @@ mod tests {
 
         // Don't use parse() helper — it injects --url which would override the env var.
         let cli = Cli::parse_from(["rj", "inspect", "my-job"]);
-        assert_eq!(cli.url, "http://jenkins.example.com:8080");
+        assert_eq!(cli.url.as_deref(), Some("http://jenkins.example.com:8080"));
 
         match saved {
             Some(v) => unsafe { std::env::set_var("JENKINS_URL", v) },
@@ -336,7 +336,7 @@ mod tests {
             "--token", "secret",
             "inspect", "my-job",
         ]);
-        assert_eq!(cli.url, "http://jenkins.local:9090");
+        assert_eq!(cli.url.as_deref(), Some("http://jenkins.local:9090"));
         assert_eq!(cli.user, "bob");
         assert_eq!(cli.token, "secret");
     }
