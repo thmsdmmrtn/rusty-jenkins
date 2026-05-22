@@ -2,6 +2,7 @@ use crate::cli::SweepArgs;
 use crate::client::{encode_job_path, JenkinsClient};
 use crate::commands::build::parse_params;
 use anyhow::{Context, Result};
+use colored::Colorize;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -52,43 +53,40 @@ pub async fn run(client: &JenkinsClient, args: &SweepArgs) -> Result<()> {
 
     let total = args.values.len();
     for (i, value) in args.values.iter().enumerate() {
-        println!("\n[{}/{}] {}={}", i + 1, total, args.param_name, value);
+        println!("\n{} {}={}",
+            format!("[{}/{}]", i + 1, total).dimmed(),
+            args.param_name.cyan(),
+            value.yellow(),
+        );
 
-        // Build the full parameter list: fixed params + the varying one.
         let mut params = fixed.clone();
         params.push((args.param_name.clone(), value.clone()));
 
-        // 1. Trigger build and resolve to a build number via the queue.
         let build_num = match trigger_and_resolve(client, &args.job, &params, args.poll_ms).await {
-            Ok(n) => {
-                println!("  Queued as build #{n}");
-                n
-            }
-            Err(e) => {
-                eprintln!("  Could not trigger build: {e:#}");
-                continue;
-            }
+            Ok(n) => { println!("  Queued as build {}", format!("#{n}").cyan()); n }
+            Err(e) => { eprintln!("  {} {e:#}", "Could not trigger build:".red()); continue; }
         };
 
-        // 2. Wait for the build to finish.
         let result = match wait_for_completion(client, &args.job, build_num, args.poll_ms).await {
             Ok(r) => r.unwrap_or_else(|| "UNKNOWN".to_string()),
-            Err(e) => {
-                eprintln!("  Error waiting for build: {e:#}");
-                continue;
-            }
+            Err(e) => { eprintln!("  {} {e:#}", "Error waiting for build:".red()); continue; }
         };
-        println!("  Result: {result}");
+        let result_colored = match result.as_str() {
+            "SUCCESS"  => result.green().to_string(),
+            "FAILURE"  => result.red().to_string(),
+            "UNSTABLE" => result.yellow().to_string(),
+            _          => result.dimmed().to_string(),
+        };
+        println!("  Result: {result_colored}");
 
-        // 3. Save the console log.
         let log_path = log_filename(out_dir, &args.job, &args.param_name, value, build_num);
         match save_log(client, &args.job, build_num, &log_path).await {
-            Ok(()) => println!("  Log:    {}", log_path.display()),
-            Err(e) => eprintln!("  Could not save log: {e:#}"),
+            Ok(()) => println!("  Log:    {}", log_path.display().to_string().dimmed()),
+            Err(e) => eprintln!("  {} {e:#}", "Could not save log:".red()),
         }
     }
 
-    println!("\nSweep complete. Logs in '{}'.", args.output_dir);
+    println!("\n{}", format!("Sweep complete. Logs in '{}'.", args.output_dir).green());
     Ok(())
 }
 

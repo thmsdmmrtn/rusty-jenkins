@@ -2,6 +2,7 @@ use crate::cli::ConfigSweepArgs;
 use crate::client::{encode_job_path, JenkinsClient};
 use crate::commands::sweep::{extract_queue_id, poll_queue, wait_for_completion};
 use anyhow::{Context, Result};
+use colored::Colorize;
 use std::path::{Path, PathBuf};
 use xmltree::{Element, XMLNode};
 
@@ -139,86 +140,77 @@ pub async fn run(client: &JenkinsClient, args: &ConfigSweepArgs) -> Result<()> {
         .with_context(|| format!("creating output directory '{}'", args.output_dir))?;
 
     // Fetch the original config once — we patch a copy each iteration.
-    println!("Fetching config.xml for '{}'…", args.job);
+    println!("Fetching config.xml for '{}'…", args.job.cyan());
     let original_xml = fetch_config(client, &args.job).await?;
 
     let total = args.values.len();
     for (i, value) in args.values.iter().enumerate() {
-        println!("\n[{}/{}] <{}> = {}", i + 1, total, args.xml_tag, value);
+        println!("\n{} {} = {}",
+            format!("[{}/{}]", i + 1, total).dimmed(),
+            format!("<{}>", args.xml_tag).cyan(),
+            value.yellow(),
+        );
 
-        // 1. Patch the parent pipeline's config XML
         let patched = match patch_xml_tag(&original_xml, &args.xml_tag, value) {
             Ok(xml) => xml,
-            Err(e) => {
-                eprintln!("  Could not patch XML: {e:#}");
-                continue;
-            }
+            Err(e) => { eprintln!("  {} {e:#}", "Could not patch XML:".red()); continue; }
         };
 
-        // 2. Upload the patched config to the parent pipeline
         if let Err(e) = upload_config(client, &args.job, &patched).await {
-            eprintln!("  Could not upload config: {e:#}");
+            eprintln!("  {} {e:#}", "Could not upload config:".red());
             continue;
         }
-        println!("  Config updated.");
+        println!("  {}", "Config updated.".green());
 
-        // Small delay to let Jenkins finish processing the config change before
-        // accepting a build request. Configurable via --post-config-delay-ms.
         if args.post_config_delay_ms > 0 {
-            println!("  Waiting {}ms for Jenkins to apply config…", args.post_config_delay_ms);
+            println!("  {}ms for Jenkins to apply config…", format!("Waiting {}", args.post_config_delay_ms).dimmed());
             tokio::time::sleep(std::time::Duration::from_millis(args.post_config_delay_ms)).await;
         }
 
-        // 3a. When targeting a specific branch, scan the parent pipeline first.
-        //     After a repo change Jenkins marks branch jobs stale until a new
-        //     scan confirms the branch exists in the new repo — without this the
-        //     branch build returns 400 no matter how long we wait.
         if args.branch.is_some() && !args.skip_scan {
             println!("  Scanning parent pipeline to index new repository…");
             match run_scan(client, &args.job, args.poll_ms).await {
-                Ok(()) => println!("  Scan complete."),
-                Err(e) => eprintln!("  Scan failed: {e:#}. Attempting branch build anyway…"),
+                Ok(()) => println!("  {}", "Scan complete.".green()),
+                Err(e) => eprintln!("  {} {e:#}. Attempting branch build anyway…", "Scan failed:".red()),
             }
-            // Brief settling delay — Jenkins needs a moment after indexing
-            // to mark branch jobs as buildable before accepting a build request.
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
 
-        // 3b. Trigger a build on the target (branch job or parent pipeline)
-        let build_num =
-            match trigger_build(client, &build_target, args.poll_ms).await {
-                Ok(n) => { println!("  Queued as build #{n}"); n }
-                Err(e) => { eprintln!("  Could not trigger build: {e:#}"); continue; }
-            };
+        let build_num = match trigger_build(client, &build_target, args.poll_ms).await {
+            Ok(n) => { println!("  Queued as build {}", format!("#{n}").cyan()); n }
+            Err(e) => { eprintln!("  {} {e:#}", "Could not trigger build:".red()); continue; }
+        };
 
-        // 4. Wait for completion on the build target
-        let result =
-            match wait_for_completion(client, &build_target, build_num, args.poll_ms).await {
-                Ok(r) => r.unwrap_or_else(|| "UNKNOWN".to_string()),
-                Err(e) => { eprintln!("  Error waiting for build: {e:#}"); continue; }
-            };
-        println!("  Result: {result}");
+        let result = match wait_for_completion(client, &build_target, build_num, args.poll_ms).await {
+            Ok(r) => r.unwrap_or_else(|| "UNKNOWN".to_string()),
+            Err(e) => { eprintln!("  {} {e:#}", "Error waiting for build:".red()); continue; }
+        };
+        let result_colored = match result.as_str() {
+            "SUCCESS" => result.green().to_string(),
+            "FAILURE" => result.red().to_string(),
+            "UNSTABLE" => result.yellow().to_string(),
+            _ => result.dimmed().to_string(),
+        };
+        println!("  Result: {result_colored}");
 
-        // 5. Save the console log from the build target
         let log_path = log_filename(out_dir, &build_target, &args.xml_tag, value, build_num);
         match save_log(client, &build_target, build_num, &log_path).await {
-            Ok(()) => println!("  Log:    {}", log_path.display()),
-            Err(e) => eprintln!("  Could not save log: {e:#}"),
+            Ok(()) => println!("  Log:    {}", log_path.display().to_string().dimmed()),
+            Err(e) => eprintln!("  {} {e:#}", "Could not save log:".red()),
         }
     }
 
-    // 6. Restore original config unless the user opted out
     if args.no_restore {
-        println!("\nSkipping config restore (--no-restore).");
+        println!("\n{}", "Skipping config restore (--no-restore).".dimmed());
     } else {
         print!("\nRestoring original config.xml… ");
         match upload_config(client, &args.job, &original_xml).await {
-            Ok(()) => println!("done."),
-            Err(e) => eprintln!("FAILED: {e:#}"),
+            Ok(()) => println!("{}", "done.".green()),
+            Err(e) => eprintln!("{} {e:#}", "FAILED:".red()),
         }
     }
 
-    println!("\nConfig sweep complete. Logs in '{}'.", args.output_dir);
+    println!("\n{}", format!("Config sweep complete. Logs in '{}'.", args.output_dir).green());
     Ok(())
 }
 

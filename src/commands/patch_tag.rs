@@ -3,22 +3,25 @@ use crate::client::{encode_job_path, JenkinsClient};
 use crate::commands::config_sweep::{patch_xml_tag, read_xml_tag};
 use crate::commands::resolve_jobs;
 use anyhow::{Context, Result};
+use colored::Colorize;
 
 pub async fn run(client: &JenkinsClient, args: &PatchTagArgs) -> Result<()> {
     let jobs = resolve_jobs(client, &args.target).await?;
     let total = jobs.len();
 
     for (i, job) in jobs.iter().enumerate() {
-        print!("[{}/{}] {job} … ", i + 1, total);
+        print!("{} {} … ", format!("[{}/{}]", i + 1, total).dimmed(), job.cyan());
         match apply(client, job, &args.xml_tag, &args.value, args.show_old).await {
             Ok(old) => {
+                let tag = format!("<{}>", args.xml_tag).cyan().to_string();
+                let new_val = args.value.green().to_string();
                 if let Some(prev) = old {
-                    println!("<{}>: {prev} → {}", args.xml_tag, args.value);
+                    println!("{tag}: {} → {new_val}", prev.yellow());
                 } else {
-                    println!("<{}> → {}", args.xml_tag, args.value);
+                    println!("{tag} → {new_val}");
                 }
             }
-            Err(e) => println!("FAILED — {e:#}"),
+            Err(e) => println!("{} {e:#}", "FAILED —".red()),
         }
     }
     Ok(())

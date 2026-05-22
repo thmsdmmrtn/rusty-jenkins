@@ -3,15 +3,16 @@ use crate::client::{encode_job_path, JenkinsClient};
 use crate::commands::config_sweep::read_xml_tag;
 use crate::commands::resolve_jobs;
 use anyhow::{Context, Result};
+use colored::Colorize;
 
 pub async fn run(client: &JenkinsClient, args: &ListTagArgs) -> Result<()> {
     let jobs = resolve_jobs(client, &args.target).await?;
 
     for job in &jobs {
         match fetch_tag(client, job, &args.xml_tag).await {
-            Ok(Some(value)) => println!("{job}:{value}"),
-            Ok(None) => println!("{job}: (tag <{}> not found)", args.xml_tag),
-            Err(e) => eprintln!("{job}: error — {e:#}"),
+            Ok(Some(value)) => println!("{}:{}", job.cyan(), value.yellow()),
+            Ok(None) => println!("{}: {}", job.cyan(), format!("(tag <{}> not found)", args.xml_tag).dimmed()),
+            Err(e) => eprintln!("{}: {} {e:#}", job.cyan(), "error —".red()),
         }
     }
     Ok(())

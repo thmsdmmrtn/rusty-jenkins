@@ -1,6 +1,7 @@
 use crate::cli::ListArgs;
 use crate::client::{encode_job_path, JenkinsClient};
 use anyhow::{Context, Result};
+use colored::Colorize;
 use serde::Deserialize;
 
 // ── Jenkins API types ─────────────────────────────────────────────────────────
@@ -69,11 +70,11 @@ pub async fn run(client: &JenkinsClient, args: &ListArgs) -> Result<()> {
 
     let info: FolderInfo = resp.json().await.context("parsing folder JSON")?;
 
-    println!("{display_path}");
+    println!("{}", display_path.cyan().bold());
 
     if info.jobs.is_empty() {
-        println!("  (empty — or this path points to a job rather than a folder)");
-        println!("  Hint: use `rj inspect <path>` for job details.");
+        println!("  {}", "(empty — or this path points to a job rather than a folder)".dimmed());
+        println!("  {}", "Hint: use `rj inspect <path>` for job details.".dimmed());
         return Ok(());
     }
 
@@ -83,15 +84,32 @@ pub async fn run(client: &JenkinsClient, args: &ListArgs) -> Result<()> {
     for entry in &info.jobs {
         if entry.is_folder() {
             folders += 1;
-            println!("  [FOLDER]  {}", entry.name);
+            println!("  {}  {}", "[FOLDER]".cyan(), entry.name.cyan());
         } else {
             jobs += 1;
-            let building = if entry.is_building() { " *building*" } else { "" };
-            println!("  [JOB]     {:<40} {}{}", entry.name, entry.status(), building);
+            let status_colored = match entry.status() {
+                "SUCCESS"  => "SUCCESS".green().to_string(),
+                "FAILED"   => "FAILED".red().to_string(),
+                "UNSTABLE" => "UNSTABLE".yellow().to_string(),
+                "ABORTED"  => "ABORTED".dimmed().to_string(),
+                "DISABLED" => "DISABLED".dimmed().to_string(),
+                other      => other.dimmed().to_string(),
+            };
+            let building = if entry.is_building() {
+                format!("  {}", "*building*".blue().bold())
+            } else {
+                String::new()
+            };
+            println!("  {}  {:<40} {}{}",
+                "[JOB]".normal(),
+                entry.name,
+                status_colored,
+                building,
+            );
         }
     }
 
-    println!("\n  {folders} folder(s), {jobs} job(s)");
+    println!("\n  {}", format!("{folders} folder(s), {jobs} job(s)").dimmed());
     Ok(())
 }
 

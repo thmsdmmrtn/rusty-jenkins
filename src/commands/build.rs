@@ -1,5 +1,6 @@
 use crate::cli::BuildArgs;
 use crate::client::{encode_job_path, JenkinsClient};
+use colored::Colorize;
 use anyhow::{Context, Result};
 
 // ── Parameter parsing ─────────────────────────────────────────────────────────
@@ -47,8 +48,8 @@ pub async fn run(client: &JenkinsClient, args: &BuildArgs) -> Result<()> {
 
     // Jenkins 201 response carries the queue item URL in the Location header.
     match resp.headers().get("Location") {
-        Some(loc) => println!("Queued: {}", loc.to_str().unwrap_or("(unreadable URL)")),
-        None => println!("Build triggered (no Location header returned)."),
+        Some(loc) => println!("{} {}", "Queued:".green(), loc.to_str().unwrap_or("(unreadable URL)").cyan()),
+        None => println!("{}", "Build triggered (no Location header returned).".green()),
     }
 
     Ok(())

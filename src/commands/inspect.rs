@@ -1,6 +1,7 @@
 use crate::cli::InspectArgs;
 use crate::client::{encode_job_path, JenkinsClient};
 use anyhow::{Context, Result};
+use colored::Colorize;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -102,8 +103,19 @@ fn format_default(p: &ParamDef) -> String {
     }
 }
 
+fn color_result(result: &str) -> String {
+    match result {
+        "SUCCESS"     => result.green().to_string(),
+        "FAILURE"     => result.red().to_string(),
+        "UNSTABLE"    => result.yellow().to_string(),
+        "ABORTED"     => result.dimmed().to_string(),
+        "IN PROGRESS" => result.blue().to_string(),
+        other         => other.normal().to_string(),
+    }
+}
+
 fn print_job(info: &JobInfo) {
-    println!("Job:        {}", info.name);
+    println!("Job:        {}", info.name.cyan().bold());
     if let Some(desc) = &info.description {
         if !desc.trim().is_empty() {
             println!("Desc:       {desc}");
@@ -112,11 +124,11 @@ fn print_job(info: &JobInfo) {
     println!("Buildable:  {}", info.buildable);
     match &info.last_build {
         Some(b) => println!(
-            "Last build: #{} — {}",
-            b.number,
-            b.result.as_deref().unwrap_or("IN PROGRESS")
+            "Last build: {} — {}",
+            format!("#{}", b.number).dimmed(),
+            color_result(b.result.as_deref().unwrap_or("IN PROGRESS"))
         ),
-        None => println!("Last build: (none)"),
+        None => println!("Last build: {}", "(none)".dimmed()),
     }
 
     let params: Vec<&ParamDef> = info
@@ -126,32 +138,32 @@ fn print_job(info: &JobInfo) {
         .collect();
 
     if params.is_empty() {
-        println!("\nNo parameters defined.");
+        println!("\n{}", "No parameters defined.".dimmed());
         return;
     }
 
-    println!("\nParameters:");
+    println!("\n{}:", "Parameters".bold());
     for p in &params {
         let kind = p.kind();
         let desc_suffix = match p.description.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(d) => format!("  — {d}"),
+            Some(d) => format!("  {}", format!("— {d}").dimmed()),
             None => String::new(),
         };
 
         if kind == "Choice" {
             println!(
-                "  {:<22} [{:<8}] Choices: {}{}",
+                "  {:<22} {} Choices: {}{}",
                 p.name,
-                kind,
-                p.choices.join(", "),
+                format!("[{kind:<8}]").cyan(),
+                p.choices.join(", ").yellow(),
                 desc_suffix,
             );
         } else {
             println!(
-                "  {:<22} [{:<8}] Default: {:<20}{}",
+                "  {:<22} {} Default: {:<20}{}",
                 p.name,
-                kind,
-                format_default(p),
+                format!("[{kind:<8}]").cyan(),
+                format_default(p).yellow(),
                 desc_suffix,
             );
         }
