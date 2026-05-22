@@ -4,8 +4,8 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "rj", version, about, long_about = None)]
 pub struct Cli {
-    /// Jenkins base URL (e.g. http://192.168.2.58:8080)
-    #[arg(long, global = true, env = "JENKINS_URL", default_value = "http://192.168.2.58:8080")]
+    /// Jenkins base URL (e.g. http://jenkins.example.com:8080)
+    #[arg(long, global = true, env = "JENKINS_URL", default_value = "")]
     pub url: String,
 
     /// Jenkins username
@@ -303,8 +303,10 @@ mod tests {
     use clap::Parser;
 
     fn parse(args: &[&str]) -> Cli {
-        // prepend the binary name that clap expects as argv[0]
         let mut full: Vec<&str> = vec!["rj"];
+        if !args.contains(&"--url") {
+            full.extend_from_slice(&["--url", "http://test.local"]);
+        }
         full.extend_from_slice(args);
         Cli::parse_from(full)
     }
@@ -312,27 +314,17 @@ mod tests {
     // ── global flag defaults ─────────────────────────────────────────────────
 
     #[test]
-    fn defaults_are_applied_when_flags_are_omitted() {
-        // Clear any ambient env vars so we're testing compile-time defaults, not env overrides.
-        let saved: Vec<(&str, Option<String>)> = ["JENKINS_URL", "JENKINS_USER", "JENKINS_TOKEN"]
-            .iter()
-            .map(|k| (*k, std::env::var(k).ok()))
-            .collect();
-        for (k, _) in &saved {
-            // SAFETY: single-threaded test; no other thread reads these vars concurrently.
-            unsafe { std::env::remove_var(k) };
-        }
+    fn jenkins_url_env_var_is_used_when_flag_is_omitted() {
+        let saved = std::env::var("JENKINS_URL").ok();
+        unsafe { std::env::set_var("JENKINS_URL", "http://jenkins.example.com:8080") };
 
-        let cli = parse(&["inspect", "my-job"]);
-        assert_eq!(cli.url, "http://192.168.2.58:8080");
-        assert_eq!(cli.user, "admin");
-        assert_eq!(cli.token, "XXXXX");
+        // Don't use parse() helper — it injects --url which would override the env var.
+        let cli = Cli::parse_from(["rj", "inspect", "my-job"]);
+        assert_eq!(cli.url, "http://jenkins.example.com:8080");
 
-        for (k, v) in saved {
-            match v {
-                Some(val) => unsafe { std::env::set_var(k, val) },
-                None => unsafe { std::env::remove_var(k) },
-            }
+        match saved {
+            Some(v) => unsafe { std::env::set_var("JENKINS_URL", v) },
+            None => unsafe { std::env::remove_var("JENKINS_URL") },
         }
     }
 

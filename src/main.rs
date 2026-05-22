@@ -22,6 +22,12 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.url.is_empty() {
+        anyhow::bail!(
+            "Jenkins URL is required. Set the JENKINS_URL environment variable or pass --url <URL>."
+        );
+    }
+
     // Diagnostic: list cookie names found in the browser, then exit.
     if cli.list_cookies {
         let browser = if cli.from_chrome { "chrome" } else { "firefox" };
