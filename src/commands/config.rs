@@ -6,8 +6,9 @@ use anyhow::{Context, Result};
 
 pub async fn run(client: &JenkinsClient, args: &ConfigArgs) -> Result<()> {
     match &args.action {
-        ConfigAction::Get(a) => get(client, a).await,
-        ConfigAction::Set(a) => set(client, a).await,
+        ConfigAction::Get(a)   => get(client, a).await,
+        ConfigAction::Set(a)   => set(client, a).await,
+        ConfigAction::Sweep(a) => crate::commands::config_sweep::run(client, a).await,
     }
 }
 

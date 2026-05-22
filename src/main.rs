@@ -6,7 +6,7 @@ mod cli;
 mod client;
 mod commands;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, TagAction};
 use clap::CommandFactory;
 use client::JenkinsClient;
 
@@ -51,13 +51,12 @@ async fn run() -> Result<()> {
         Some(Command::Logs(args))    => commands::logs::run(&client, args).await,
         Some(Command::Config(args))  => commands::config::run(&client, args).await,
         Some(Command::Sweep(args))   => commands::sweep::run(&client, args).await,
-        Some(Command::List(args))        => commands::list::run(&client, args).await,
-        Some(Command::ConfigSweep(args)) => commands::config_sweep::run(&client, args).await,
-        Some(Command::ListTag(args))     => commands::list_tag::run(&client, args).await,
-        Some(Command::PatchTag(args))    => commands::patch_tag::run(&client, args).await,
+        Some(Command::List(args))    => commands::list::run(&client, args).await,
+        Some(Command::Tag(tag))      => match &tag.action {
+            TagAction::List(args)  => commands::list_tag::run(&client, args).await,
+            TagAction::Patch(args) => commands::patch_tag::run(&client, args).await,
+        },
         None => {
-            // No subcommand and --list-cookies was already handled above.
-            // Print help so the user knows what's available.
             Cli::command().print_help()?;
             println!();
             Ok(())

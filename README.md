@@ -12,9 +12,9 @@ A modular, async Rust CLI for the Jenkins REST API.
 | `config get` | Download and print a job's `config.xml` |
 | `config set` | Upload a local `config.xml` to replace a job's configuration |
 | `sweep` | Run a job repeatedly, varying one parameter each time, and save each build's log |
-| `config-sweep` | Patch an XML tag in a job's config for each value, trigger a build, save the log, then restore |
-| `list-tag` | Read the value of an XML tag from every job in a folder or explicit list |
-| `patch-tag` | Set an XML tag in every job in a folder or explicit list — no build, no restore |
+| `config sweep` | Patch an XML tag in a job's config for each value, trigger a build, save the log, then restore |
+| `tag list` | Read the value of an XML tag from every job in a folder or explicit list |
+| `tag patch` | Set an XML tag in every job in a folder or explicit list — no build, no restore |
 | `list` | List the jobs and sub-folders inside a folder (or the root) |
 
 All commands handle Basic Auth and Jenkins CSRF crumbs automatically.
@@ -416,12 +416,12 @@ Log files are named `{job}__{param}__{value}__#{build}.log`. A build failure or 
 
 ---
 
-### `config-sweep`
+### `config sweep`
 
 Iterate over a list of values by patching an XML tag in the job's `config.xml` before each build. Useful when the variation lives in the job configuration rather than a build parameter — for example, changing **Branch Sources → Repository Name** in a Multibranch Pipeline.
 
 ```bash
-rj config-sweep <job> \
+rj config sweep <job> \
     --xml-tag <tag> \
     --value <val1> <val2> <val3> \
     [--branch <branch>] \
@@ -451,7 +451,7 @@ For a GitHub Branch Source the tag is typically `<repository>`:
 When sweeping a Multibranch Pipeline, use `--branch` to build a specific branch directly instead of triggering a full scan that would kick off every branch:
 
 ```bash
-rj config-sweep PIPELINE-NAME \
+rj config sweep PIPELINE-NAME \
     --xml-tag repository \
     --value repo-a repo-b repo-c \
     --branch main \
@@ -507,19 +507,19 @@ Log files are named `{pipeline}__{branch}__{tag}__{value}__#{build}.log` when `-
 
 ---
 
-### `list-tag`
+### `tag list`
 
 Read the value of an XML tag from every job in a folder or an explicit list. Useful for auditing configuration across many jobs at once — for example, checking which branch each pipeline is set to.
 
 ```bash
 # Every job in a folder
-rj list-tag --path folder/subfolder --xml-tag repository
+rj tag list --path folder/subfolder --xml-tag repository
 
 # Specific jobs only
-rj list-tag --job-name folder/job1 --job-name folder/job3 --xml-tag repository
+rj tag list --job-name folder/job1 --job-name folder/job3 --xml-tag repository
 
 # Both — combine a folder scan with extra individual jobs
-rj list-tag --path folder --job-name other-folder/special-job --xml-tag repository
+rj tag list --path folder --job-name other-folder/special-job --xml-tag repository
 ```
 
 **Example output:**
@@ -540,19 +540,19 @@ If a job's config does not contain the tag, the line reads `(tag <name> not foun
 
 ---
 
-### `patch-tag`
+### `tag patch`
 
-Set the value of an XML tag in every job in a folder or explicit list. Unlike `config-sweep`, this does not trigger a build and does not restore the original config — the change is permanent.
+Set the value of an XML tag in every job in a folder or explicit list. Unlike `config sweep`, this does not trigger a build and does not restore the original config — the change is permanent.
 
 ```bash
 # Set the branch for every job in a folder
-rj patch-tag --path folder/subfolder --xml-tag branches/name --value "*/develop"
+rj tag patch --path folder/subfolder --xml-tag branches/name --value "*/develop"
 
 # Only specific jobs
-rj patch-tag --job-name folder/job1 --job-name folder/job3 --xml-tag branches/name --value "*/s3"
+rj tag patch --job-name folder/job1 --job-name folder/job3 --xml-tag branches/name --value "*/s3"
 
 # Show the existing value before the new one for easy auditing
-rj patch-tag --path folder --xml-tag branches/name --value "*/develop" --show-old
+rj tag patch --path folder --xml-tag branches/name --value "*/develop" --show-old
 ```
 
 **Example output (with `--show-old`):**
@@ -587,7 +587,7 @@ Failures on individual jobs are printed and the loop continues to the remaining 
 
 ### XML tag paths
 
-Both `list-tag` and `patch-tag` accept a `/`-separated path for `--xml-tag` to disambiguate when multiple elements share the same tag name. Each segment is found by depth-first search within the match of the previous segment.
+Both `tag list` and `tag patch` accept a `/`-separated path for `--xml-tag` to disambiguate when multiple elements share the same tag name. Each segment is found by depth-first search within the match of the previous segment.
 
 **Example — a pipeline config with two `<name>` elements:**
 
@@ -648,7 +648,7 @@ src/
 | `serde` / `serde_json` | JSON deserialisation |
 | `anyhow` | Ergonomic error propagation with context chains |
 | `rusqlite` (bundled) | Read Firefox/Chrome cookie databases |
-| `xmltree` | In-memory XML patching for `config-sweep` |
+| `xmltree` | In-memory XML patching for `config sweep` |
 | `aes-gcm` | AES-256-GCM decryption for Chrome cookies (Windows) |
 | `cbc` / `pbkdf2` / `sha1` *(macOS)* | AES-128-CBC + key derivation for Chrome cookies (macOS) |
 | `wiremock` *(dev)* | Mock HTTP server for integration tests |
@@ -675,4 +675,4 @@ cargo test
 - Folder listing: color-to-status mapping, `_anime` building detection, folder vs job class detection, root vs nested path routing (wiremock + unit)
 - Browser cookie extraction: hostname parsing, Firefox profile discovery, Chrome AES-GCM/CBC roundtrip decryption (unit)
 - Config sweep: XML tag patching, `--branch` targeting, HTTP 400 retry with backoff, full build loop with config restore (wiremock + unit)
-- `list-tag` / `patch-tag`: folder-to-job resolution, XML tag read/write, per-job error isolation (wiremock + unit)
+- `tag list` / `tag patch`: folder-to-job resolution, XML tag read/write, per-job error isolation (wiremock + unit)

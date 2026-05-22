@@ -60,26 +60,17 @@ pub enum Command {
     /// Stream live console log for a job's most-recent (or specific) build
     Logs(LogsArgs),
 
-    /// Get or set a job's XML configuration
+    /// Get, set, or sweep a job's XML configuration
     Config(ConfigArgs),
 
-    /// Run a job repeatedly, varying one parameter each time, and save each build's log
+    /// Run a job repeatedly, varying one build parameter each time, and save logs
     Sweep(SweepArgs),
 
     /// List the jobs and sub-folders inside a folder (or the root)
     List(ListArgs),
 
-    /// Patch an XML tag in a job's config, trigger a build for each value,
-    /// wait for completion, save the log, then restore the original config
-    ConfigSweep(ConfigSweepArgs),
-
-    /// Read the value of an XML tag from the config of each job in a folder
-    /// or explicit list — e.g. show which branch every pipeline is set to
-    ListTag(ListTagArgs),
-
-    /// Set an XML tag in the config of each job in a folder or explicit list
-    /// without triggering builds or restoring the original config
-    PatchTag(PatchTagArgs),
+    /// Read or set XML tag values across multiple jobs at once
+    Tag(TagArgs),
 }
 
 // ── inspect ──────────────────────────────────────────────────────────────────
@@ -133,6 +124,9 @@ pub enum ConfigAction {
 
     /// Upload a local config.xml file to replace the job's configuration
     Set(ConfigSetArgs),
+
+    /// Patch an XML tag for each value, trigger a build, save the log, then restore
+    Sweep(ConfigSweepArgs),
 }
 
 #[derive(Debug, Args)]
@@ -237,7 +231,24 @@ pub struct ConfigSweepArgs {
     pub no_restore: bool,
 }
 
-// ── list-tag / patch-tag ──────────────────────────────────────────────────────
+// ── tag ───────────────────────────────────────────────────────────────────────
+
+/// Operations on XML tag values across multiple jobs (`rj tag list` / `rj tag patch`)
+#[derive(Debug, Args)]
+pub struct TagArgs {
+    #[command(subcommand)]
+    pub action: TagAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TagAction {
+    /// Read the value of an XML tag from each job in a folder or explicit list
+    List(ListTagArgs),
+
+    /// Set the value of an XML tag in each job in a folder or explicit list
+    /// (no build triggered, no restore)
+    Patch(PatchTagArgs),
+}
 
 /// Shared job targeting — use one or both flags together.
 #[derive(Debug, Args)]
