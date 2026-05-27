@@ -131,8 +131,13 @@ pub enum ConfigAction {
 
 #[derive(Debug, Args)]
 pub struct ConfigGetArgs {
-    /// Jenkins job name
-    pub job: String,
+    #[command(flatten)]
+    pub target: JobTarget,
+
+    /// Directory to save configs into (one .xml file per job, named after the job path).
+    /// If omitted, configs are printed to stdout.
+    #[arg(long)]
+    pub output_dir: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -253,15 +258,19 @@ pub enum TagAction {
 /// Shared job targeting — use one or both flags together.
 #[derive(Debug, Args)]
 pub struct JobTarget {
-    /// Folder path: operate on every direct job child (non-recursive).
-    /// e.g. --path folder/subfolder
-    #[arg(long)]
-    pub path: Option<String>,
+    /// Folder path(s) to target (repeatable: --path a --path b).
+    /// Operates on every direct job child; combine with --recursive to descend.
+    #[arg(long = "path")]
+    pub paths: Vec<String>,
 
     /// Specific job(s) to target (repeatable).
     /// e.g. --job-name folder/job1 --job-name folder/job2
     #[arg(long = "job-name")]
     pub job_names: Vec<String>,
+
+    /// Recurse into sub-folders when using --path.
+    #[arg(long, default_value_t = false)]
+    pub recursive: bool,
 }
 
 #[derive(Debug, Args)]
@@ -269,9 +278,10 @@ pub struct ListTagArgs {
     #[command(flatten)]
     pub target: JobTarget,
 
-    /// XML tag whose value to read from each job's config.xml
-    #[arg(long)]
-    pub xml_tag: String,
+    /// XML tag(s) whose value to read from each job's config.xml (repeatable).
+    /// e.g. --xml-tag repository --xml-tag branch
+    #[arg(long = "xml-tag")]
+    pub xml_tags: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -279,13 +289,14 @@ pub struct PatchTagArgs {
     #[command(flatten)]
     pub target: JobTarget,
 
-    /// XML tag to update in each job's config.xml
-    #[arg(long)]
-    pub xml_tag: String,
+    /// XML tag(s) to update (repeatable, paired 1-to-1 with --value).
+    /// e.g. --xml-tag repository --value new-repo --xml-tag branch --value main
+    #[arg(long = "xml-tag")]
+    pub xml_tags: Vec<String>,
 
-    /// Value to set
+    /// Value(s) to set — each is paired with the corresponding --xml-tag (repeatable).
     #[arg(long)]
-    pub value: String,
+    pub values: Vec<String>,
 
     /// Show the existing value before the new one — useful for auditing or
     /// catching accidental changes: `<tag>: old-value → new-value`
@@ -409,10 +420,28 @@ mod tests {
 
     #[test]
     fn config_get_parses_job_name() {
-        let cli = parse(&["config", "get", "my-job"]);
+        let cli = parse(&["config", "get", "--job-name", "my-job"]);
         match cli.command {
             Some(Command::Config(cfg)) => match cfg.action {
-                ConfigAction::Get(args) => assert_eq!(args.job, "my-job"),
+                ConfigAction::Get(args) => {
+                    assert_eq!(args.target.job_names, vec!["my-job"]);
+                    assert!(args.output_dir.is_none());
+                }
+                _ => panic!("expected Get variant"),
+            },
+            _ => panic!("expected Config variant"),
+        }
+    }
+
+    #[test]
+    fn config_get_parses_path_and_output_dir() {
+        let cli = parse(&["config", "get", "--path", "my-folder", "--output-dir", "/tmp/configs"]);
+        match cli.command {
+            Some(Command::Config(cfg)) => match cfg.action {
+                ConfigAction::Get(args) => {
+                    assert_eq!(args.target.paths, vec!["my-folder"]);
+                    assert_eq!(args.output_dir.as_deref(), Some("/tmp/configs"));
+                }
                 _ => panic!("expected Get variant"),
             },
             _ => panic!("expected Config variant"),

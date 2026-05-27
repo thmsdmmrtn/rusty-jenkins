@@ -6,35 +6,48 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 
 pub async fn run(client: &JenkinsClient, args: &PatchTagArgs) -> Result<()> {
+    if args.xml_tags.is_empty() {
+        anyhow::bail!("at least one --xml-tag is required");
+    }
+    if args.xml_tags.len() != args.values.len() {
+        anyhow::bail!(
+            "--xml-tag count ({}) does not match --value count ({})",
+            args.xml_tags.len(),
+            args.values.len()
+        );
+    }
+
     let jobs = resolve_jobs(client, &args.target).await?;
     let total = jobs.len();
 
     for (i, job) in jobs.iter().enumerate() {
-        print!("{} {} … ", format!("[{}/{}]", i + 1, total).dimmed(), job.cyan());
-        match apply(client, job, &args.xml_tag, &args.value, args.show_old).await {
-            Ok(old) => {
-                let tag = format!("<{}>", args.xml_tag).cyan().to_string();
-                let new_val = args.value.green().to_string();
-                if let Some(prev) = old {
-                    println!("{tag}: {} → {new_val}", prev.yellow());
-                } else {
-                    println!("{tag} → {new_val}");
+        println!("{} {}", format!("[{}/{}]", i + 1, total).dimmed(), job.cyan());
+        match apply(client, job, &args.xml_tags, &args.values, args.show_old).await {
+            Ok(old_values) => {
+                for (j, (tag, new_val)) in args.xml_tags.iter().zip(args.values.iter()).enumerate() {
+                    let tag_fmt = format!("<{tag}>").cyan().to_string();
+                    let new_fmt = new_val.green().to_string();
+                    match old_values.get(j).and_then(|v| v.as_ref()) {
+                        Some(prev) => println!("  {tag_fmt}: {} → {new_fmt}", prev.yellow()),
+                        None       => println!("  {tag_fmt} → {new_fmt}"),
+                    }
                 }
             }
-            Err(e) => println!("{} {e:#}", "FAILED —".red()),
+            Err(e) => println!("  {} {e:#}", "FAILED —".red()),
         }
     }
     Ok(())
 }
 
-/// Returns the old value when `show_old` is true, `None` otherwise.
+/// Fetch config.xml once, apply all tag patches, upload once.
+/// Returns old values per tag (populated only when `show_old` is true).
 async fn apply(
     client: &JenkinsClient,
     job: &str,
-    tag: &str,
-    value: &str,
+    tags: &[String],
+    values: &[String],
     show_old: bool,
-) -> Result<Option<String>> {
+) -> Result<Vec<Option<String>>> {
     let path = format!("job/{}/config.xml", encode_job_path(job));
 
     let resp = client.get(&path).await?;
@@ -44,19 +57,24 @@ async fn apply(
     }
     let original = resp.text().await.context("reading config.xml")?;
 
-    let old = if show_old {
-        read_xml_tag(&original, tag)?
+    let old_values: Vec<Option<String>> = if show_old {
+        tags.iter()
+            .map(|tag| read_xml_tag(&original, tag))
+            .collect::<Result<_>>()?
     } else {
-        None
+        vec![None; tags.len()]
     };
 
-    let patched = patch_xml_tag(&original, tag, value)?;
+    let mut xml = original;
+    for (tag, value) in tags.iter().zip(values.iter()) {
+        xml = patch_xml_tag(&xml, tag, value)?;
+    }
 
     let resp = client
         .post(&path)
         .await?
         .header("Content-Type", "application/xml")
-        .body(patched)
+        .body(xml)
         .send()
         .await
         .context("uploading config.xml")?;
@@ -65,7 +83,7 @@ async fn apply(
     if !status.is_success() {
         anyhow::bail!("POST config.xml returned HTTP {status}");
     }
-    Ok(old)
+    Ok(old_values)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -86,7 +104,10 @@ mod tests {
 
     const SAMPLE_XML: &str = r#"<?xml version="1.0"?>
 <project>
-  <scm><remote>git@github.com:org/old-repo.git</remote></scm>
+  <scm>
+    <remote>git@github.com:org/old-repo.git</remote>
+    <branch>develop</branch>
+  </scm>
 </project>"#;
 
     #[tokio::test]
@@ -119,15 +140,56 @@ mod tests {
         let client = JenkinsClient::new(&server.uri(), "u", "p");
         let args = PatchTagArgs {
             target: crate::cli::JobTarget {
-                path: None,
+                paths: vec![],
                 job_names: vec!["abc/job1".into(), "abc/job2".into()],
+                recursive: false,
             },
-            xml_tag: "remote".into(),
-            value: "new-repo".into(),
+            xml_tags: vec!["remote".into()],
+            values: vec!["new-repo".into()],
             show_old: false,
         };
         run(&client, &args).await.unwrap();
-        // wiremock asserts expect(1) on each POST on drop
+    }
+
+    #[tokio::test]
+    async fn patches_multiple_tags_in_single_upload() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/crumbIssuer/api/json"))
+            .respond_with(crumb())
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/job/abc/job/job1/config.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_XML))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Both tag changes must appear in the single POST body.
+        Mock::given(method("POST"))
+            .and(path("/job/abc/job/job1/config.xml"))
+            .and(body_string_contains("<remote>new-remote</remote>"))
+            .and(body_string_contains("<branch>main</branch>"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = JenkinsClient::new(&server.uri(), "u", "p");
+        let args = PatchTagArgs {
+            target: crate::cli::JobTarget {
+                paths: vec![],
+                job_names: vec!["abc/job1".into()],
+                recursive: false,
+            },
+            xml_tags: vec!["remote".into(), "branch".into()],
+            values: vec!["new-remote".into(), "main".into()],
+            show_old: false,
+        };
+        run(&client, &args).await.unwrap();
     }
 
     #[tokio::test]
@@ -170,15 +232,15 @@ mod tests {
         let client = JenkinsClient::new(&server.uri(), "u", "p");
         let args = PatchTagArgs {
             target: crate::cli::JobTarget {
-                path: Some("team".into()),
+                paths: vec!["team".into()],
                 job_names: vec![],
+                recursive: false,
             },
-            xml_tag: "remote".into(),
-            value: "new-value".into(),
+            xml_tags: vec!["remote".into()],
+            values: vec!["new-value".into()],
             show_old: false,
         };
         run(&client, &args).await.unwrap();
-        // sub-folder is skipped; only alpha + beta are patched
     }
 
     #[tokio::test]
@@ -191,14 +253,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        // job1: config fetch fails
         Mock::given(method("GET"))
             .and(path("/job/abc/job/job1/config.xml"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
 
-        // job2: succeeds
         Mock::given(method("GET"))
             .and(path("/job/abc/job/job2/config.xml"))
             .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_XML))
@@ -214,14 +274,32 @@ mod tests {
         let client = JenkinsClient::new(&server.uri(), "u", "p");
         let args = PatchTagArgs {
             target: crate::cli::JobTarget {
-                path: None,
+                paths: vec![],
                 job_names: vec!["abc/job1".into(), "abc/job2".into()],
+                recursive: false,
             },
-            xml_tag: "remote".into(),
-            value: "x".into(),
+            xml_tags: vec!["remote".into()],
+            values: vec!["x".into()],
             show_old: false,
         };
-        // Should not bail — job1 failure is printed but loop continues to job2
         run(&client, &args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn errors_when_tag_value_counts_mismatch() {
+        let server = MockServer::start().await;
+        let client = JenkinsClient::new(&server.uri(), "u", "p");
+        let args = PatchTagArgs {
+            target: crate::cli::JobTarget {
+                paths: vec![],
+                job_names: vec!["abc/job1".into()],
+                recursive: false,
+            },
+            xml_tags: vec!["tag1".into(), "tag2".into()],
+            values: vec!["val1".into()],
+            show_old: false,
+        };
+        let err = run(&client, &args).await.unwrap_err();
+        assert!(err.to_string().contains("does not match"));
     }
 }

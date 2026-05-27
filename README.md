@@ -9,12 +9,12 @@ A modular, async Rust CLI for the Jenkins REST API.
 | `inspect` | Show a job's parameters, types, defaults, and last build status |
 | `build` | Trigger a plain or parameterized build |
 | `logs` | Stream live console output by polling `progressiveText` |
-| `config get` | Download and print a job's `config.xml` |
+| `config get` | Download `config.xml` for a job, a folder of jobs, or a recursive tree — print to stdout or save to files |
 | `config set` | Upload a local `config.xml` to replace a job's configuration |
 | `sweep` | Run a job repeatedly, varying one parameter each time, and save each build's log |
 | `config sweep` | Patch an XML tag in a job's config for each value, trigger a build, save the log, then restore |
-| `tag list` | Read the value of an XML tag from every job in a folder or explicit list |
-| `tag patch` | Set an XML tag in every job in a folder or explicit list — no build, no restore |
+| `tag list` | Read one or more XML tag values from every job in a folder or explicit list |
+| `tag patch` | Set one or more XML tag values across a folder or explicit list — no build, no restore |
 | `list` | List the jobs and sub-folders inside a folder (or the root) |
 
 All commands handle Basic Auth and Jenkins CSRF crumbs automatically.
@@ -319,17 +319,44 @@ The loop polls `/logText/progressiveText`, advances the byte offset using `X-Tex
 
 ### `config get`
 
-Print the raw `config.xml` for a job:
+Print the raw `config.xml` for a single job:
 
 ```bash
-rj config get <job>
+rj config get --job-name my-job
 ```
 
-Pipe it to a file to edit locally:
+Save to a file to edit locally:
 
 ```bash
-rj config get my-job > my-job.xml
+rj config get --job-name my-job > my-job.xml
 ```
+
+Dump every job in a folder to stdout (each config preceded by a `=== job ===` header):
+
+```bash
+rj config get --path folder/subfolder
+```
+
+Save each config to a separate file in a directory (named `folder_jobname.xml`):
+
+```bash
+rj config get --path folder/subfolder --output-dir ./configs
+```
+
+Recurse into all sub-folders:
+
+```bash
+rj config get --path folder --recursive --output-dir ./configs
+```
+
+| Flag | Description |
+|---|---|
+| `--job-name` | Specific job path (repeatable) |
+| `--path` | Folder to scan — all direct non-folder children (repeatable) |
+| `--recursive` | Descend into sub-folders when using `--path` |
+| `--output-dir` | Directory to save `.xml` files into; if omitted, configs are printed to stdout |
+
+> `--job-name` and `--path` validate the target type — passing a folder path to `--job-name` (or a leaf job to `--path`) produces a clear error.
 
 ---
 
@@ -344,7 +371,7 @@ rj config set <job> <file>
 Example workflow — download, edit, re-upload:
 
 ```bash
-rj config get my-job > my-job.xml
+rj config get --job-name my-job > my-job.xml
 # edit my-job.xml
 rj config set my-job my-job.xml
 ```
@@ -435,7 +462,7 @@ rj config sweep <job> \
 
 ```bash
 # Inspect the parent pipeline's XML to find the field you want to change
-rj config get PIPELINE-NAME | grep -A2 -B2 repository
+rj config get --job-name PIPELINE-NAME | grep -A2 -B2 repository
 ```
 
 For a GitHub Branch Source the tag is typically `<repository>`:
@@ -509,20 +536,26 @@ Log files are named `{pipeline}__{branch}__{tag}__{value}__#{build}.log` when `-
 
 ### `tag list`
 
-Read the value of an XML tag from every job in a folder or an explicit list. Useful for auditing configuration across many jobs at once — for example, checking which branch each pipeline is set to.
+Read one or more XML tag values from every job in a folder or an explicit list. Useful for auditing configuration across many jobs at once — for example, checking which branch each pipeline is set to.
 
 ```bash
 # Every job in a folder
 rj tag list --path folder/subfolder --xml-tag repository
 
+# Recurse into all sub-folders
+rj tag list --path folder --recursive --xml-tag repository
+
+# Multiple folders
+rj tag list --path team-a --path team-b --xml-tag repository
+
 # Specific jobs only
 rj tag list --job-name folder/job1 --job-name folder/job3 --xml-tag repository
 
-# Both — combine a folder scan with extra individual jobs
-rj tag list --path folder --job-name other-folder/special-job --xml-tag repository
+# Multiple tags — config.xml is fetched once per job
+rj tag list --path folder --xml-tag repository --xml-tag fallbackBranch
 ```
 
-**Example output:**
+**Single-tag output:**
 
 ```
 folder/job1:s3
@@ -530,58 +563,90 @@ folder/job2:deep-clear
 folder/job3:main
 ```
 
-If a job's config does not contain the tag, the line reads `(tag <name> not found)`. Errors on individual jobs are printed and the loop continues.
+**Multi-tag output:**
+
+```
+folder/job1
+  repository:s3
+  fallbackBranch:main
+folder/job2
+  repository:deep-clear
+  fallbackBranch:develop
+```
+
+If a job's config does not contain a tag, the line reads `(tag <name> not found)`. Errors on individual jobs are printed and the loop continues.
 
 | Flag | Description |
 |---|---|
-| `--path` | Folder to scan — all direct (non-folder) job children are included |
+| `--path` | Folder to scan — all direct non-folder children (repeatable) |
+| `--recursive` | Descend into sub-folders when using `--path` |
 | `--job-name` | Specific job path (repeatable) |
-| `--xml-tag` | XML tag whose text content to read |
+| `--xml-tag` | XML tag whose text content to read (repeatable) |
 
 ---
 
 ### `tag patch`
 
-Set the value of an XML tag in every job in a folder or explicit list. Unlike `config sweep`, this does not trigger a build and does not restore the original config — the change is permanent.
+Set one or more XML tag values across every job in a folder or explicit list. Unlike `config sweep`, this does not trigger a build and does not restore the original config — the change is permanent. All tag patches for a job are applied in a single `config.xml` fetch and upload.
 
 ```bash
-# Set the branch for every job in a folder
+# Set one tag for every job in a folder
 rj tag patch --path folder/subfolder --xml-tag branches/name --value "*/develop"
+
+# Recurse into all sub-folders
+rj tag patch --path folder --recursive --xml-tag branches/name --value "*/develop"
+
+# Multiple folders
+rj tag patch --path team-a --path team-b --xml-tag branches/name --value "*/main"
 
 # Only specific jobs
 rj tag patch --job-name folder/job1 --job-name folder/job3 --xml-tag branches/name --value "*/s3"
 
-# Show the existing value before the new one for easy auditing
+# Patch multiple tags at once — each --value is paired with the preceding --xml-tag
+rj tag patch --path folder \
+    --xml-tag repository --value new-repo \
+    --xml-tag fallbackBranch --value main
+
+# Show existing values before the new ones for easy auditing
 rj tag patch --path folder --xml-tag branches/name --value "*/develop" --show-old
 ```
 
-**Example output (with `--show-old`):**
+**Example output (single tag, with `--show-old`):**
 
 ```
-[1/3] folder/job1 … <branches/name>: */main → */develop
-[2/3] folder/job2 … <branches/name>: */staging → */develop
-[3/3] folder/job3 … <branches/name>: */develop → */develop
+[1/3] folder/job1
+  <branches/name>: */main → */develop
+[2/3] folder/job2
+  <branches/name>: */staging → */develop
+[3/3] folder/job3
+  <branches/name>: */develop → */develop
 ```
 
-**Example output (without `--show-old`):**
+**Example output (multiple tags):**
 
 ```
-[1/3] folder/job1 … <branches/name> → */develop
-[2/3] folder/job2 … <branches/name> → */develop
-[3/3] folder/job3 … <branches/name> → */develop
+[1/2] folder/job1
+  <repository> → new-repo
+  <fallbackBranch> → main
+[2/2] folder/job2
+  <repository> → new-repo
+  <fallbackBranch> → main
 ```
 
 Failures on individual jobs are printed and the loop continues to the remaining jobs.
 
 | Flag | Description |
 |---|---|
-| `--path` | Folder to scan — all direct (non-folder) job children are included |
+| `--path` | Folder to scan — all direct non-folder children (repeatable) |
+| `--recursive` | Descend into sub-folders when using `--path` |
 | `--job-name` | Specific job path (repeatable) |
-| `--xml-tag` | XML tag to update (supports `/`-separated paths — see below) |
-| `--value` | New value to set |
+| `--xml-tag` | XML tag to update — supports `/`-separated paths (repeatable, paired 1-to-1 with `--value`) |
+| `--value` | Value to set — each is paired with the corresponding `--xml-tag` (repeatable) |
 | `--show-old` | Print the existing value before the new one |
 
-> Sub-folders inside `--path` are skipped — only direct job children are targeted, preventing accidental mass updates across deeply nested structures.
+> `--xml-tag` and `--value` are paired by position. If the counts don't match, `rj` errors before making any changes.
+
+> Sub-folders inside `--path` are skipped by default — add `--recursive` to descend.
 
 ---
 
@@ -661,7 +726,7 @@ src/
 cargo test
 ```
 
-122 tests across all modules, covering:
+133 tests across all modules, covering:
 
 - CLI argument parsing including shell-array-style multi-value flags (unit)
 - Basic Auth header attachment (wiremock)
@@ -675,4 +740,7 @@ cargo test
 - Folder listing: color-to-status mapping, `_anime` building detection, folder vs job class detection, root vs nested path routing (wiremock + unit)
 - Browser cookie extraction: hostname parsing, Firefox profile discovery, Chrome AES-GCM/CBC roundtrip decryption (unit)
 - Config sweep: XML tag patching, `--branch` targeting, HTTP 400 retry with backoff, full build loop with config restore (wiremock + unit)
-- `tag list` / `tag patch`: folder-to-job resolution, XML tag read/write, per-job error isolation (wiremock + unit)
+- `tag list` / `tag patch`: folder-to-job resolution, multi-tag read in a single fetch, multi-tag patch in a single upload, per-job error isolation (wiremock + unit)
+- `config get`: single-job stdout, multi-job folder fetch, file saving with underscored filenames (wiremock + unit)
+- Folder/job validation: `--job-name` with a folder path and `--path` with a leaf job both produce clear errors (wiremock + unit)
+- Recursive folder traversal: async-recursive subfolder descent, multiple `--path` flags combined (wiremock + unit)

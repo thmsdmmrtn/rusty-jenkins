@@ -6,19 +6,46 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 
 pub async fn run(client: &JenkinsClient, args: &ListTagArgs) -> Result<()> {
+    if args.xml_tags.is_empty() {
+        anyhow::bail!("at least one --xml-tag is required");
+    }
+
     let jobs = resolve_jobs(client, &args.target).await?;
+    let multi = args.xml_tags.len() > 1;
 
     for job in &jobs {
-        match fetch_tag(client, job, &args.xml_tag).await {
-            Ok(Some(value)) => println!("{}:{}", job.cyan(), value.yellow()),
-            Ok(None) => println!("{}: {}", job.cyan(), format!("(tag <{}> not found)", args.xml_tag).dimmed()),
+        match fetch_tags(client, job, &args.xml_tags).await {
+            Ok(values) => {
+                if multi {
+                    println!("{}", job.cyan());
+                    for (tag, val) in args.xml_tags.iter().zip(values) {
+                        match val {
+                            Some(v) => println!("  {}:{}", tag.cyan(), v.yellow()),
+                            None => println!("  {}", format!("(tag <{tag}> not found)").dimmed()),
+                        }
+                    }
+                } else {
+                    match values.into_iter().next().unwrap() {
+                        Some(v) => println!("{}:{}", job.cyan(), v.yellow()),
+                        None => println!(
+                            "{}: {}",
+                            job.cyan(),
+                            format!("(tag <{}> not found)", args.xml_tags[0]).dimmed()
+                        ),
+                    }
+                }
+            }
             Err(e) => eprintln!("{}: {} {e:#}", job.cyan(), "error —".red()),
         }
     }
     Ok(())
 }
 
-async fn fetch_tag(client: &JenkinsClient, job: &str, tag: &str) -> Result<Option<String>> {
+async fn fetch_tags(
+    client: &JenkinsClient,
+    job: &str,
+    tags: &[String],
+) -> Result<Vec<Option<String>>> {
     let resp = client
         .get(&format!("job/{}/config.xml", encode_job_path(job)))
         .await?;
@@ -27,7 +54,7 @@ async fn fetch_tag(client: &JenkinsClient, job: &str, tag: &str) -> Result<Optio
         anyhow::bail!("HTTP {status}");
     }
     let xml = resp.text().await.context("reading config.xml")?;
-    read_xml_tag(&xml, tag)
+    tags.iter().map(|tag| read_xml_tag(&xml, tag)).collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,6 +72,7 @@ mod tests {
   <sources><data><jenkins.branch.BranchSource>
     <source class="...GitHubSCMSource">
       <repository>s3</repository>
+      <branch>main</branch>
     </source>
   </jenkins.branch.BranchSource></data></sources>
 </org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject>"#;
@@ -55,11 +83,11 @@ mod tests {
 
         for job in ["folder/job1", "folder/job2"] {
             Mock::given(method("GET"))
-                .and(path(format!("/job/folder/job/{job_name}/config.xml",
-                    job_name = job.split('/').last().unwrap())))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_string(SAMPLE_XML),
-                )
+                .and(path(format!(
+                    "/job/folder/job/{job_name}/config.xml",
+                    job_name = job.split('/').last().unwrap()
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_XML))
                 .mount(&server)
                 .await;
         }
@@ -67,10 +95,11 @@ mod tests {
         let client = JenkinsClient::new(&server.uri(), "u", "p");
         let args = ListTagArgs {
             target: crate::cli::JobTarget {
-                path: None,
+                paths: vec![],
                 job_names: vec!["folder/job1".into(), "folder/job2".into()],
+                recursive: false,
             },
-            xml_tag: "repository".into(),
+            xml_tags: vec!["repository".into()],
         };
         run(&client, &args).await.unwrap();
     }
@@ -93,9 +122,7 @@ mod tests {
         for job_name in ["job1", "job2"] {
             Mock::given(method("GET"))
                 .and(path(format!("/job/abc/job/{job_name}/config.xml")))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_string(SAMPLE_XML),
-                )
+                .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_XML))
                 .mount(&server)
                 .await;
         }
@@ -103,10 +130,35 @@ mod tests {
         let client = JenkinsClient::new(&server.uri(), "u", "p");
         let args = ListTagArgs {
             target: crate::cli::JobTarget {
-                path: Some("abc".into()),
+                paths: vec!["abc".into()],
                 job_names: vec![],
+                recursive: false,
             },
-            xml_tag: "repository".into(),
+            xml_tags: vec!["repository".into()],
+        };
+        run(&client, &args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lists_multiple_tags_from_single_config_fetch() {
+        let server = MockServer::start().await;
+
+        // Only one GET to config.xml even when multiple tags are requested.
+        Mock::given(method("GET"))
+            .and(path("/job/abc/job/job1/config.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_XML))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = JenkinsClient::new(&server.uri(), "u", "p");
+        let args = ListTagArgs {
+            target: crate::cli::JobTarget {
+                paths: vec![],
+                job_names: vec!["abc/job1".into()],
+                recursive: false,
+            },
+            xml_tags: vec!["repository".into(), "branch".into()],
         };
         run(&client, &args).await.unwrap();
     }
@@ -123,12 +175,28 @@ mod tests {
         let client = JenkinsClient::new(&server.uri(), "u", "p");
         let args = ListTagArgs {
             target: crate::cli::JobTarget {
-                path: None,
+                paths: vec![],
                 job_names: vec!["abc/job1".into()],
+                recursive: false,
             },
-            xml_tag: "missing-tag".into(),
+            xml_tags: vec!["missing-tag".into()],
         };
-        // Should not error — just prints "(tag not found)"
         run(&client, &args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn errors_when_no_xml_tag_provided() {
+        let server = MockServer::start().await;
+        let client = JenkinsClient::new(&server.uri(), "u", "p");
+        let args = ListTagArgs {
+            target: crate::cli::JobTarget {
+                paths: vec![],
+                job_names: vec!["abc/job1".into()],
+                recursive: false,
+            },
+            xml_tags: vec![],
+        };
+        let err = run(&client, &args).await.unwrap_err();
+        assert!(err.to_string().contains("--xml-tag"));
     }
 }

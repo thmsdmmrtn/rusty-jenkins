@@ -1,6 +1,8 @@
 use crate::cli::{ConfigAction, ConfigArgs, ConfigGetArgs, ConfigSetArgs};
 use crate::client::{encode_job_path, JenkinsClient};
+use crate::commands::resolve_jobs;
 use anyhow::{Context, Result};
+use colored::Colorize;
 
 // ── Command dispatcher ────────────────────────────────────────────────────────
 
@@ -15,15 +17,41 @@ pub async fn run(client: &JenkinsClient, args: &ConfigArgs) -> Result<()> {
 // ── config get ────────────────────────────────────────────────────────────────
 
 async fn get(client: &JenkinsClient, args: &ConfigGetArgs) -> Result<()> {
-    let resp = client.get(&format!("job/{}/config.xml", encode_job_path(&args.job))).await?;
+    let jobs = resolve_jobs(client, &args.target).await?;
+    let multi = jobs.len() > 1;
 
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("Jenkins returned HTTP {status} for job '{}'", args.job);
+    if let Some(dir) = &args.output_dir {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating output directory '{dir}'"))?;
     }
 
-    let xml = resp.text().await.context("reading config.xml body")?;
-    println!("{xml}");
+    for job in &jobs {
+        let resp = client
+            .get(&format!("job/{}/config.xml", encode_job_path(job)))
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            eprintln!("{}: HTTP {status}", job.cyan());
+            continue;
+        }
+        let xml = resp.text().await.context("reading config.xml body")?;
+
+        match &args.output_dir {
+            Some(dir) => {
+                let filename = format!("{}.xml", job.replace('/', "_"));
+                let dest = std::path::Path::new(dir).join(&filename);
+                std::fs::write(&dest, &xml)
+                    .with_context(|| format!("writing '{}'", dest.display()))?;
+                println!("saved: {}", dest.display().to_string().green());
+            }
+            None => {
+                if multi {
+                    println!("{}", format!("=== {job} ===").cyan().bold());
+                }
+                println!("{xml}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -80,11 +108,36 @@ mod tests {
         }))
     }
 
+    fn job_target(job: &str) -> crate::cli::JobTarget {
+        crate::cli::JobTarget {
+            paths: vec![],
+            job_names: vec![job.to_string()],
+            recursive: false,
+        }
+    }
+
+    fn folder_target(folder: &str) -> crate::cli::JobTarget {
+        crate::cli::JobTarget {
+            paths: vec![folder.to_string()],
+            job_names: vec![],
+            recursive: false,
+        }
+    }
+
     // ── config get ────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn get_fetches_config_xml_from_correct_endpoint() {
         let server = MockServer::start().await;
+
+        // validation call
+        Mock::given(method("GET"))
+            .and(path("/job/my-job/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                &serde_json::json!({ "_class": "org.jenkinsci.plugins.workflow.job.WorkflowJob" }),
+            ))
+            .mount(&server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path("/job/my-job/config.xml"))
@@ -98,24 +151,102 @@ mod tests {
             .await;
 
         let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
-        let args = ConfigGetArgs { job: "my-job".to_string() };
+        let args = ConfigGetArgs { target: job_target("my-job"), output_dir: None };
         get(&client, &args).await.unwrap();
     }
 
     #[tokio::test]
-    async fn get_returns_error_on_404() {
+    async fn get_saves_to_file_when_output_dir_given() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/job/missing/config.xml"))
-            .respond_with(ResponseTemplate::new(404))
+            .and(path("/job/my-job/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                &serde_json::json!({ "_class": "WorkflowJob" }),
+            ))
             .mount(&server)
             .await;
 
+        Mock::given(method("GET"))
+            .and(path("/job/my-job/config.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_XML))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp_dir = std::env::temp_dir().join("rj_test_config_get_save");
         let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
-        let args = ConfigGetArgs { job: "missing".to_string() };
-        let err = get(&client, &args).await.unwrap_err();
-        assert!(err.to_string().contains("404"));
+        let args = ConfigGetArgs {
+            target: job_target("my-job"),
+            output_dir: Some(tmp_dir.to_str().unwrap().to_string()),
+        };
+        get(&client, &args).await.unwrap();
+
+        let saved = std::fs::read_to_string(tmp_dir.join("my-job.xml")).unwrap();
+        assert!(saved.contains("<command>echo hello</command>"));
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn get_fetches_all_jobs_in_folder() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/job/my-folder/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                "_class": "com.cloudbees.hudson.plugins.folder.Folder",
+                "jobs": [
+                    { "name": "job1", "_class": "WorkflowJob" },
+                    { "name": "job2", "_class": "WorkflowJob" },
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        for job_name in ["job1", "job2"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/job/my-folder/job/{job_name}/config.xml")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_XML))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
+        let args = ConfigGetArgs { target: folder_target("my-folder"), output_dir: None };
+        get(&client, &args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_saves_folder_jobs_with_underscored_filenames() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/job/team/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                "_class": "com.cloudbees.hudson.plugins.folder.Folder",
+                "jobs": [{ "name": "svc", "_class": "WorkflowJob" }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/job/team/job/svc/config.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_XML))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp_dir = std::env::temp_dir().join("rj_test_config_get_folder_save");
+        let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
+        let args = ConfigGetArgs {
+            target: folder_target("team"),
+            output_dir: Some(tmp_dir.to_str().unwrap().to_string()),
+        };
+        get(&client, &args).await.unwrap();
+
+        assert!(tmp_dir.join("team_svc.xml").exists());
+        std::fs::remove_dir_all(&tmp_dir).ok();
     }
 
     // ── config set ────────────────────────────────────────────────────────────
@@ -161,7 +292,6 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Verify a distinctive string from the XML body is present in the request.
         Mock::given(method("POST"))
             .and(path("/job/my-job/config.xml"))
             .and(body_string_contains("<command>echo hello</command>"))
@@ -217,7 +347,6 @@ mod tests {
 
     #[tokio::test]
     async fn set_returns_error_when_file_does_not_exist() {
-        // No network involved — should fail before making any HTTP call.
         let client = crate::client::JenkinsClient::new("http://127.0.0.1:1", "u", "p");
         let args = ConfigSetArgs {
             job: "my-job".to_string(),
@@ -264,17 +393,26 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
+            .and(path("/job/dispatch-job/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                &serde_json::json!({ "_class": "WorkflowJob" }),
+            ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
             .and(path("/job/dispatch-job/config.xml"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(SAMPLE_XML),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE_XML))
             .expect(1)
             .mount(&server)
             .await;
 
         let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
         let args = ConfigArgs {
-            action: ConfigAction::Get(ConfigGetArgs { job: "dispatch-job".to_string() }),
+            action: ConfigAction::Get(ConfigGetArgs {
+                target: job_target("dispatch-job"),
+                output_dir: None,
+            }),
         };
         run(&client, &args).await.unwrap();
     }
