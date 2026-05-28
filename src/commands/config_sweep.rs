@@ -519,7 +519,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const SAMPLE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject>
+<org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject plugin="workflow-multibranch@2.26.4">
+  <disabled>false</disabled>
   <sources>
     <data>
       <jenkins.branch.BranchSource>
