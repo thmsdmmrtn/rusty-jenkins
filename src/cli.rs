@@ -295,7 +295,7 @@ pub struct PatchTagArgs {
     pub xml_tags: Vec<String>,
 
     /// Value(s) to set — each is paired with the corresponding --xml-tag (repeatable).
-    #[arg(long)]
+    #[arg(long = "value")]
     pub values: Vec<String>,
 
     /// Show the existing value before the new one — useful for auditing or

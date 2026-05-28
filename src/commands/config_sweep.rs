@@ -167,6 +167,14 @@ pub async fn run(client: &JenkinsClient, args: &ConfigSweepArgs) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_millis(args.post_config_delay_ms)).await;
         }
 
+        // Snapshot the branch's last build number before scanning so we can
+        // detect whether the scan auto-triggers one (and avoid a second trigger).
+        let pre_scan_build = if args.branch.is_some() && !args.skip_scan {
+            get_last_build_num(client, &build_target).await.ok().flatten()
+        } else {
+            None
+        };
+
         if args.branch.is_some() && !args.skip_scan {
             println!("  Scanning parent pipeline to index new repository…");
             match run_scan(client, &args.job, args.poll_ms).await {
@@ -176,9 +184,23 @@ pub async fn run(client: &JenkinsClient, args: &ConfigSweepArgs) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
 
-        let build_num = match trigger_build(client, &build_target, args.poll_ms).await {
-            Ok(n) => { println!("  Queued as build {}", format!("#{n}").cyan()); n }
-            Err(e) => { eprintln!("  {} {e:#}", "Could not trigger build:".red()); continue; }
+        // If the scan auto-triggered a branch build (common when Jenkins has
+        // "Build when branch is first discovered" enabled), use it — triggering
+        // another would cause "superseded by build #N" and wasted runs.
+        let auto_build = if args.branch.is_some() && !args.skip_scan {
+            find_scan_auto_build(client, &build_target, pre_scan_build, args.poll_ms).await
+        } else {
+            None
+        };
+
+        let build_num = if let Some(n) = auto_build {
+            println!("  Scan triggered build {} automatically.", format!("#{n}").cyan());
+            n
+        } else {
+            match trigger_build(client, &build_target, args.poll_ms).await {
+                Ok(n) => { println!("  Queued as build {}", format!("#{n}").cyan()); n }
+                Err(e) => { eprintln!("  {} {e:#}", "Could not trigger build:".red()); continue; }
+            }
         };
 
         let result = match wait_for_completion(client, &build_target, build_num, args.poll_ms).await {
@@ -383,6 +405,76 @@ async fn trigger_build(client: &JenkinsClient, job: &str, poll_ms: u64) -> Resul
         "build trigger failed after {MAX_ATTEMPTS} attempts on both /build and \
          /buildWithParameters — check the 400 messages above for Jenkins' reason"
     )
+}
+
+/// Fetch the last completed build number for `job`, or `None` if there are none.
+async fn get_last_build_num(client: &JenkinsClient, job: &str) -> Result<Option<u64>> {
+    #[derive(serde::Deserialize)]
+    struct Info {
+        #[serde(rename = "lastBuild")]
+        last_build: Option<BuildRef>,
+    }
+    #[derive(serde::Deserialize)]
+    struct BuildRef { number: u64 }
+
+    let path = format!("job/{}/api/json?tree=lastBuild[number]", encode_job_path(job));
+    let resp = client.get(&path).await?;
+    if !resp.status().is_success() { return Ok(None); }
+    let info: Info = resp.json().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(info.last_build.map(|b| b.number))
+}
+
+/// After a scan, check whether Jenkins auto-triggered a branch build.
+/// Returns the build number if one was auto-triggered, `None` otherwise.
+async fn find_scan_auto_build(
+    client: &JenkinsClient,
+    job: &str,
+    pre_scan_build: Option<u64>,
+    poll_ms: u64,
+) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Info {
+        #[serde(rename = "inQueue", default)]
+        in_queue: bool,
+        #[serde(rename = "queueItem")]
+        queue_item: Option<QueueItem>,
+        #[serde(rename = "lastBuild")]
+        last_build: Option<BuildRef>,
+    }
+    #[derive(serde::Deserialize)]
+    struct QueueItem { id: u64 }
+    #[derive(serde::Deserialize)]
+    struct BuildRef { number: u64 }
+
+    let path = format!(
+        "job/{}/api/json?tree=inQueue,queueItem[id],lastBuild[number]",
+        encode_job_path(job)
+    );
+    let resp = match client.get(&path).await {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    if !resp.status().is_success() { return None; }
+    let info: Info = match resp.json().await {
+        Ok(i) => i,
+        Err(_) => return None,
+    };
+
+    // The scan queued a build that is still pending.
+    if info.in_queue {
+        if let Some(qi) = info.queue_item {
+            return poll_queue(client, qi.id, poll_ms).await.ok();
+        }
+    }
+
+    // The scan already started a build that wasn't there before.
+    if let Some(lb) = info.last_build {
+        if pre_scan_build.map_or(true, |pre| lb.number > pre) {
+            return Some(lb.number);
+        }
+    }
+
+    None
 }
 
 async fn save_log(client: &JenkinsClient, job: &str, build: u64, path: &Path) -> Result<()> {
@@ -884,6 +976,15 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/job/my-pipeline/config.xml"))
             .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // Pre-scan snapshot + post-scan auto-build check (both return no build)
+        Mock::given(method("GET"))
+            .and(path("/job/my-pipeline/job/main/api/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&serde_json::json!({
+                "inQueue": false, "lastBuild": null
+            })))
             .mount(&server)
             .await;
 
