@@ -349,6 +349,10 @@ async fn upload_config(client: &JenkinsClient, job: &str, xml: &str) -> Result<(
 /// only accept `buildWithParameters` even for jobs with no parameters.
 /// Retries up to 5 attempts with exponential backoff between attempts.
 async fn trigger_build(client: &JenkinsClient, job: &str, poll_ms: u64) -> Result<u64> {
+    // Snapshot before triggering — used to detect the new build when Jenkins returns
+    // 200 without a Location header (CloudBees CI behaviour for branch builds).
+    let pre_build = get_last_build_num(client, job).await.ok().flatten();
+
     const MAX_ATTEMPTS: u32 = 5;
     let mut delay_ms = 2_000u64;
 
@@ -382,20 +386,31 @@ async fn trigger_build(client: &JenkinsClient, job: &str, poll_ms: u64) -> Resul
                 );
             }
 
-            // CloudBees CI / some Jenkins versions return 200 without a Location header
-            // for branch builds (same behaviour as for scan triggers). In that case
-            // the build was started synchronously or was already queued by the scan;
-            // find it rather than erroring.
+            // CloudBees CI / some Jenkins instances return 200 without a Location header
+            // for branch builds (same behaviour as for scan triggers). Poll lastBuild
+            // until a number higher than the pre-trigger snapshot appears.
             let Some(location) = resp
                 .headers()
                 .get("Location")
                 .and_then(|v| v.to_str().ok())
                 .map(String::from)
             else {
-                if let Some(n) = find_scan_auto_build(client, job, None, poll_ms).await {
-                    return Ok(n);
+                let check_interval = poll_ms.max(2_000);
+                for i in 0..30u32 {
+                    if i > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(check_interval)).await;
+                    }
+                    if let Ok(Some(n)) = get_last_build_num(client, job).await {
+                        if pre_build.map_or(true, |p| n > p) {
+                            return Ok(n);
+                        }
+                    }
                 }
-                anyhow::bail!("no Location header in build response and no new build found");
+                anyhow::bail!(
+                    "Jenkins returned 200 with no Location header and no new build \
+                     appeared after polling — check that the branch job exists and \
+                     is not already at its build limit"
+                );
             };
 
             let queue_id = extract_queue_id(&location)?;
@@ -443,22 +458,13 @@ async fn find_scan_auto_build(
 ) -> Option<u64> {
     #[derive(serde::Deserialize)]
     struct Info {
-        #[serde(rename = "inQueue", default)]
-        in_queue: bool,
-        #[serde(rename = "queueItem")]
-        queue_item: Option<QueueItem>,
         #[serde(rename = "lastBuild")]
         last_build: Option<BuildRef>,
     }
     #[derive(serde::Deserialize)]
-    struct QueueItem { id: u64 }
-    #[derive(serde::Deserialize)]
     struct BuildRef { number: u64 }
 
-    let path = format!(
-        "job/{}/api/json?tree=inQueue,queueItem[id],lastBuild[number]",
-        encode_job_path(job)
-    );
+    let path = format!("job/{}/api/json?tree=lastBuild[number]", encode_job_path(job));
 
     // When poll_ms == 0 (tests) check once. In real usage poll for several intervals
     // so a build that appears seconds after scan completion isn't missed.
@@ -470,24 +476,10 @@ async fn find_scan_auto_build(
             tokio::time::sleep(std::time::Duration::from_millis(effective_poll)).await;
         }
 
-        let resp = match client.get(&path).await {
-            Ok(r) => r,
-            Err(_) => return None,
-        };
+        let resp = match client.get(&path).await { Ok(r) => r, Err(_) => return None };
         if !resp.status().is_success() { return None; }
-        let info: Info = match resp.json().await {
-            Ok(i) => i,
-            Err(_) => return None,
-        };
+        let info: Info = match resp.json().await { Ok(i) => i, Err(_) => return None };
 
-        // The scan queued a build that is still pending.
-        if info.in_queue {
-            if let Some(qi) = info.queue_item {
-                return poll_queue(client, qi.id, poll_ms).await.ok();
-            }
-        }
-
-        // The scan already started a build that wasn't there before.
         if let Some(lb) = info.last_build {
             if pre_scan_build.map_or(true, |pre| lb.number > pre) {
                 return Some(lb.number);
