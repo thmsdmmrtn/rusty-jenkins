@@ -197,7 +197,7 @@ pub async fn run(client: &JenkinsClient, args: &ConfigSweepArgs) -> Result<()> {
             println!("  Scan triggered build {} automatically.", format!("#{n}").cyan());
             n
         } else {
-            match trigger_build(client, &build_target, args.poll_ms).await {
+            match trigger_build(client, &build_target, args.poll_ms, pre_scan_build).await {
                 Ok(n) => { println!("  Queued as build {}", format!("#{n}").cyan()); n }
                 Err(e) => { eprintln!("  {} {e:#}", "Could not trigger build:".red()); continue; }
             }
@@ -348,18 +348,36 @@ async fn upload_config(client: &JenkinsClient, job: &str, xml: &str) -> Result<(
 /// that returns 400. Multibranch pipeline branches in CloudBees CI sometimes
 /// only accept `buildWithParameters` even for jobs with no parameters.
 /// Retries up to 5 attempts with exponential backoff between attempts.
-async fn trigger_build(client: &JenkinsClient, job: &str, poll_ms: u64) -> Result<u64> {
-    // Snapshot before triggering — used to detect the new build when Jenkins returns
-    // 200 without a Location header (CloudBees CI behaviour for branch builds).
+async fn trigger_build(
+    client: &JenkinsClient,
+    job: &str,
+    poll_ms: u64,
+    // Build number captured before the scan ran. When Jenkins returns 200 with no
+    // Location header (CloudBees CI behaviour for branch builds), we poll until
+    // lastBuild.number exceeds this. Using the pre-SCAN snapshot rather than a
+    // pre-trigger snapshot prevents missing a build that the scan auto-triggered
+    // and that already started by the time we took the local snapshot.
+    pre_scan_build: Option<u64>,
+) -> Result<u64> {
     let pre_build = get_last_build_num(client, job).await.ok().flatten();
+    // Pre-scan baseline is more conservative; fall back to pre-build when no scan ran.
+    let baseline = pre_scan_build.or(pre_build);
+
+    eprintln!(
+        "  [trigger] job={job}  baseline={}",
+        baseline.map_or("none".to_string(), |n| format!("#{n}"))
+    );
 
     const MAX_ATTEMPTS: u32 = 5;
     let mut delay_ms = 2_000u64;
 
     for attempt in 1..=MAX_ATTEMPTS {
         for endpoint in ["build", "buildWithParameters"] {
+            let url = format!("job/{}/{endpoint}", encode_job_path(job));
+            eprintln!("  [trigger] POST /{url}  (attempt {attempt}/{MAX_ATTEMPTS})");
+
             let resp = client
-                .post(&format!("job/{}/{endpoint}", encode_job_path(job)))
+                .post(&url)
                 .await?
                 .form(&Vec::<(String, String)>::new())
                 .send()
@@ -367,6 +385,15 @@ async fn trigger_build(client: &JenkinsClient, job: &str, poll_ms: u64) -> Resul
                 .with_context(|| format!("triggering build via /{endpoint}"))?;
 
             let status = resp.status();
+            let location_hdr = resp
+                .headers()
+                .get("Location")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            eprintln!(
+                "  [trigger] → HTTP {status}  Location={}",
+                location_hdr.as_deref().unwrap_or("(none)")
+            );
 
             if status == 400 {
                 let body = resp.text().await.unwrap_or_default();
@@ -374,7 +401,6 @@ async fn trigger_build(client: &JenkinsClient, job: &str, poll_ms: u64) -> Resul
                 eprintln!(
                     "  HTTP 400 via /{endpoint} (attempt {attempt}/{MAX_ATTEMPTS}): {body_preview}"
                 );
-                // Try the other endpoint within this attempt before giving up.
                 continue;
             }
 
@@ -386,30 +412,37 @@ async fn trigger_build(client: &JenkinsClient, job: &str, poll_ms: u64) -> Resul
                 );
             }
 
-            // CloudBees CI / some Jenkins instances return 200 without a Location header
-            // for branch builds (same behaviour as for scan triggers). Poll lastBuild
-            // until a number higher than the pre-trigger snapshot appears.
-            let Some(location) = resp
-                .headers()
-                .get("Location")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from)
-            else {
+            let Some(location) = location_hdr else {
+                // CloudBees CI / some Jenkins instances return 200 without a Location
+                // header for branch builds. Poll lastBuild until a number higher than
+                // the pre-scan baseline appears.
                 let check_interval = poll_ms.max(2_000);
+                eprintln!(
+                    "  [trigger] no Location header — polling lastBuild > {} every {check_interval}ms",
+                    baseline.map_or("none".to_string(), |n| format!("#{n}"))
+                );
                 for i in 0..30u32 {
                     if i > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(check_interval)).await;
                     }
-                    if let Ok(Some(n)) = get_last_build_num(client, job).await {
-                        if pre_build.map_or(true, |p| n > p) {
+                    let current = get_last_build_num(client, job).await.ok().flatten();
+                    eprintln!(
+                        "  [trigger] poll {}/{}: lastBuild={}",
+                        i + 1, 30,
+                        current.map_or("none".to_string(), |n| format!("#{n}"))
+                    );
+                    if let Some(n) = current {
+                        if baseline.map_or(true, |b| n > b) {
+                            eprintln!("  [trigger] found build #{n}");
                             return Ok(n);
                         }
                     }
                 }
                 anyhow::bail!(
                     "Jenkins returned 200 with no Location header and no new build \
-                     appeared after polling — check that the branch job exists and \
-                     is not already at its build limit"
+                     appeared after polling (baseline={}) — \
+                     check that the branch job exists and is not disabled",
+                    baseline.map_or("none".to_string(), |n| format!("#{n}"))
                 );
             };
 
@@ -918,7 +951,7 @@ mod tests {
             .await;
 
         let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
-        let build_num = trigger_build(&client, "my-job", 0).await.unwrap();
+        let build_num = trigger_build(&client, "my-job", 0, None).await.unwrap();
         assert_eq!(build_num, 5);
     }
 
@@ -966,7 +999,7 @@ mod tests {
             .await;
 
         let client = crate::client::JenkinsClient::new(&server.uri(), "u", "p");
-        let build_num = trigger_build(&client, "my-job", 0).await.unwrap();
+        let build_num = trigger_build(&client, "my-job", 0, None).await.unwrap();
         assert_eq!(build_num, 7);
     }
 
