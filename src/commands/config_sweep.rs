@@ -421,20 +421,36 @@ async fn trigger_build(
                     "  [trigger] no Location header — polling lastBuild > {} every {check_interval}ms",
                     baseline.map_or("none".to_string(), |n| format!("#{n}"))
                 );
+                let poll_path = format!(
+                    "job/{}/api/json?tree=lastBuild[number]",
+                    encode_job_path(job)
+                );
                 for i in 0..30u32 {
                     if i > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(check_interval)).await;
                     }
-                    let current = get_last_build_num(client, job).await.ok().flatten();
-                    eprintln!(
-                        "  [trigger] poll {}/{}: lastBuild={}",
-                        i + 1, 30,
-                        current.map_or("none".to_string(), |n| format!("#{n}"))
-                    );
-                    if let Some(n) = current {
-                        if baseline.map_or(true, |b| n > b) {
-                            eprintln!("  [trigger] found build #{n}");
-                            return Ok(n);
+                    match client.get(&poll_path).await {
+                        Err(e) => {
+                            eprintln!("  [trigger] poll {}/30: GET /{poll_path} — request error: {e}", i + 1);
+                        }
+                        Ok(r) => {
+                            let status = r.status();
+                            let body = r.text().await.unwrap_or_default();
+                            // Parse lastBuild.number from the raw body.
+                            let build_num: Option<u64> = serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|v| v["lastBuild"]["number"].as_u64());
+                            eprintln!(
+                                "  [trigger] poll {}/30: HTTP {status}  body={body}  lastBuild={}",
+                                i + 1,
+                                build_num.map_or("none".to_string(), |n| format!("#{n}"))
+                            );
+                            if let Some(n) = build_num {
+                                if baseline.map_or(true, |b| n > b) {
+                                    eprintln!("  [trigger] found build #{n}");
+                                    return Ok(n);
+                                }
+                            }
                         }
                     }
                 }
