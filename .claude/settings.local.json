@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo --version)",
+      "Bash(timeout 300 cargo build)",
+      "Bash(cargo add *)",
+      "Bash(timeout 400 cargo build)",
+      "Bash(timeout 400 cargo test)"
+    ]
+  }
+}

@@ -6,6 +6,8 @@ pub mod list;
 pub mod list_tag;
 pub mod logs;
 pub mod patch_tag;
+pub mod profiles;
+pub mod run;
 pub mod sweep;
 
 use crate::cli::JobTarget;

@@ -4,6 +4,12 @@ use crate::commands::config_sweep::read_xml_tag;
 use crate::commands::resolve_jobs;
 use anyhow::{Context, Result};
 use colored::Colorize;
+use futures::stream::{self, StreamExt};
+
+/// Cap on in-flight config.xml fetches. A folder can hold hundreds of jobs;
+/// this reads them concurrently for a large speed-up while staying well under
+/// Jenkins' per-client connection limits.
+const MAX_CONCURRENCY: usize = 8;
 
 pub async fn run(client: &JenkinsClient, args: &ListTagArgs) -> Result<()> {
     if args.xml_tags.is_empty() {
@@ -13,8 +19,20 @@ pub async fn run(client: &JenkinsClient, args: &ListTagArgs) -> Result<()> {
     let jobs = resolve_jobs(client, &args.target).await?;
     let multi = args.xml_tags.len() > 1;
 
-    for job in &jobs {
-        match fetch_tags(client, job, &args.xml_tags).await {
+    // Fetch every job's tags concurrently (bounded), but keep the original job
+    // order in the output: `buffered` yields results in input order regardless
+    // of which request finishes first, so the display stays deterministic.
+    let results: Vec<(String, Result<Vec<Option<String>>>)> = stream::iter(jobs)
+        .map(|job| async move {
+            let values = fetch_tags(client, &job, &args.xml_tags).await;
+            (job, values)
+        })
+        .buffered(MAX_CONCURRENCY)
+        .collect()
+        .await;
+
+    for (job, result) in results {
+        match result {
             Ok(values) => {
                 if multi {
                     println!("{}", job.cyan());

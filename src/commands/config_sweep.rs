@@ -363,21 +363,13 @@ async fn trigger_build(
     // Pre-scan baseline is more conservative; fall back to pre-build when no scan ran.
     let baseline = pre_scan_build.or(pre_build);
 
-    eprintln!(
-        "  [trigger] job={job}  baseline={}",
-        baseline.map_or("none".to_string(), |n| format!("#{n}"))
-    );
-
     const MAX_ATTEMPTS: u32 = 5;
     let mut delay_ms = 2_000u64;
 
     for attempt in 1..=MAX_ATTEMPTS {
         for endpoint in ["build", "buildWithParameters"] {
-            let url = format!("job/{}/{endpoint}", encode_job_path(job));
-            eprintln!("  [trigger] POST /{url}  (attempt {attempt}/{MAX_ATTEMPTS})");
-
             let resp = client
-                .post(&url)
+                .post(&format!("job/{}/{endpoint}", encode_job_path(job)))
                 .await?
                 .form(&Vec::<(String, String)>::new())
                 .send()
@@ -390,10 +382,6 @@ async fn trigger_build(
                 .get("Location")
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            eprintln!(
-                "  [trigger] → HTTP {status}  Location={}",
-                location_hdr.as_deref().unwrap_or("(none)")
-            );
 
             if status == 400 {
                 let body = resp.text().await.unwrap_or_default();
@@ -417,12 +405,8 @@ async fn trigger_build(
                 // header for branch builds. Poll lastBuild until a number higher than
                 // the pre-scan baseline appears.
                 let check_interval = poll_ms.max(2_000);
-                eprintln!(
-                    "  [trigger] no Location header — polling lastBuild > {} every {check_interval}ms",
-                    baseline.map_or("none".to_string(), |n| format!("#{n}"))
-                );
                 let poll_path = format!(
-                    "job/{}/api/json?tree=lastBuild[number]",
+                    "job/{}/api/json?tree=_class,lastBuild[number]",
                     encode_job_path(job)
                 );
                 for i in 0..30u32 {
@@ -430,24 +414,28 @@ async fn trigger_build(
                         tokio::time::sleep(std::time::Duration::from_millis(check_interval)).await;
                     }
                     match client.get(&poll_path).await {
-                        Err(e) => {
-                            eprintln!("  [trigger] poll {}/30: GET /{poll_path} — request error: {e}", i + 1);
-                        }
+                        Err(_) => {}
                         Ok(r) => {
-                            let status = r.status();
                             let body = r.text().await.unwrap_or_default();
-                            // Parse lastBuild.number from the raw body.
-                            let build_num: Option<u64> = serde_json::from_str::<serde_json::Value>(&body)
-                                .ok()
-                                .and_then(|v| v["lastBuild"]["number"].as_u64());
-                            eprintln!(
-                                "  [trigger] poll {}/30: HTTP {status}  body={body}  lastBuild={}",
-                                i + 1,
-                                build_num.map_or("none".to_string(), |n| format!("#{n}"))
-                            );
+                            let val: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            let class = val["_class"].as_str().unwrap_or("");
+                            let build_num = val["lastBuild"]["number"].as_u64();
+
+                            // Fail fast if we're accidentally polling the parent
+                            // multibranch pipeline (it has no lastBuild).
+                            if class.contains("MultiBranch") || class.contains("OrganizationFolder") {
+                                anyhow::bail!(
+                                    "build trigger reached the multibranch pipeline parent \
+                                     instead of a branch job — use --branch to specify which \
+                                     branch to build, e.g. --branch main\n\
+                                     (polled: {}/{poll_path})",
+                                    client.base_url
+                                );
+                            }
+
                             if let Some(n) = build_num {
                                 if baseline.map_or(true, |b| n > b) {
-                                    eprintln!("  [trigger] found build #{n}");
                                     return Ok(n);
                                 }
                             }

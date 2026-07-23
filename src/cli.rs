@@ -45,6 +45,11 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub list_cookies: bool,
 
+    /// Path to the profile manifest (rj.toml). If omitted, rj searches upward
+    /// from the current directory, like git looking for a repo root.
+    #[arg(long, global = true, env = "RJ_MANIFEST")]
+    pub manifest: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -71,6 +76,13 @@ pub enum Command {
 
     /// Read or set XML tag values across multiple jobs at once
     Tag(TagArgs),
+
+    /// Trigger a build from a named profile in rj.toml (collapses many
+    /// parameters behind one name — ideal for Jenkinsfile consumption)
+    Run(RunArgs),
+
+    /// List the profiles defined in the manifest (rj.toml)
+    Profiles(ProfilesArgs),
 }
 
 // ── inspect ──────────────────────────────────────────────────────────────────
@@ -186,6 +198,47 @@ pub struct ListArgs {
     /// Folder path to list (slash-separated, e.g. "folder/subfolder").
     /// Omit to list the Jenkins root.
     pub path: Option<String>,
+}
+
+// ── run (profile-driven build) ────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Name of the profile to run (as defined under [profiles.<name>] in rj.toml)
+    pub profile: String,
+
+    /// Override or add a build parameter (-p KEY=VALUE, repeatable).
+    /// Takes precedence over every value the profile resolves to.
+    #[arg(short = 'p', long = "param", value_name = "KEY=VALUE")]
+    pub params: Vec<String>,
+
+    /// Override the job the profile targets (rarely needed).
+    #[arg(long)]
+    pub job: Option<String>,
+
+    /// Resolve the profile and print the job + parameters WITHOUT triggering a
+    /// build. Use this in review/CI to validate a manifest change safely.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Wait for the triggered build to finish and report its result
+    /// (exit code is non-zero if the build does not end in SUCCESS).
+    #[arg(long, default_value_t = false)]
+    pub wait: bool,
+
+    /// Polling interval in milliseconds while waiting for the build.
+    #[arg(long, default_value_t = 2000)]
+    pub poll_ms: u64,
+}
+
+// ── profiles (list) ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct ProfilesArgs {
+    /// Show the fully-resolved parameters for each profile (after applying
+    /// `extends` inheritance), not just its name and description.
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
 }
 
 // ── config-sweep ─────────────────────────────────────────────────────────────
