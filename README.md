@@ -16,6 +16,8 @@ A modular, async Rust CLI for the Jenkins REST API.
 | `tag list` | Read one or more XML tag values from every job in a folder or explicit list |
 | `tag patch` | Set one or more XML tag values across a folder or explicit list — no build, no restore |
 | `list` | List the jobs and sub-folders inside a folder (or the root) |
+| `run` | Trigger a build from a named profile in `rj.toml` — one name instead of dozens of `-p` flags |
+| `profiles` | List the profiles defined in `rj.toml` (offline — never contacts Jenkins) |
 
 All commands handle Basic Auth and Jenkins CSRF crumbs automatically.
 
@@ -650,6 +652,64 @@ Failures on individual jobs are printed and the loop continues to the remaining 
 
 ---
 
+### `run` and `profiles` — the profile manifest (`rj.toml`)
+
+When a Jenkins job wraps a powerful CLI tool, its parameter list tends to grow into an unmaintainable wall of 30+ string and boolean inputs. The profile manifest moves that parameter surface out of the Jenkins UI and into a version-controlled TOML file that lives next to your code:
+
+```toml
+# rj.toml — discovered by walking up from the current directory, like .git
+[defaults]
+url = "https://jenkins.example.com"     # fallback when JENKINS_URL isn't set
+
+[profiles.base-tests]
+job = "platform/integration-tests"
+[profiles.base-tests.params]
+REGION = "us-east-1"
+RETRIES = 3          # numbers and booleans don't need quoting
+VERBOSE = false
+
+[profiles.nightly]
+extends = "base-tests"                  # inherits job + params; redeclared keys win
+description = "Full nightly regression suite"
+[profiles.nightly.params]
+SUITE = "full"
+PARALLELISM = 8
+```
+
+```bash
+rj run nightly                  # trigger with the profile's full parameter bundle
+rj run nightly -p SUITE=smoke   # CLI -p overrides beat everything in the manifest
+rj run nightly --dry-run        # print the resolved job + params, trigger nothing
+rj run nightly --wait           # block until done; non-SUCCESS → non-zero exit
+rj profiles                     # list profiles (offline)
+rj profiles --verbose           # …with fully-resolved params after inheritance
+```
+
+**Precedence** (highest wins): CLI `-p` override → profile's own params → each `extends` ancestor in order. Cycles and missing parents are detected with clear errors.
+
+**Inside a Jenkinsfile**, this collapses the job's parameter UI to a single `PROFILE` choice — see [examples/Jenkinsfile](examples/Jenkinsfile) and [examples/rj.toml](examples/rj.toml) for the full pattern:
+
+```groovy
+stage('Run') {
+    steps {
+        sh 'rj run "${PROFILE}" --wait'
+    }
+}
+```
+
+Parameter changes become reviewable pull requests against `rj.toml` instead of hand-edits of the Jenkins job configuration, and `rj run <profile> --dry-run` validates a manifest change in CI before anything is triggered.
+
+| Flag | Description |
+|---|---|
+| `--manifest <path>` / `RJ_MANIFEST` | Explicit manifest path (default: search upward for `rj.toml`) |
+| `-p KEY=VALUE` | Override or add a parameter (repeatable, highest precedence) |
+| `--job <path>` | Override the job the profile targets |
+| `--dry-run` | Resolve and print without triggering |
+| `--wait` | Wait for the build; exit non-zero unless it ends in SUCCESS |
+| `--poll-ms` | Polling interval while waiting (default 2000) |
+
+---
+
 ### XML tag paths
 
 Both `tag list` and `tag patch` accept a `/`-separated path for `--xml-tag` to disambiguate when multiple elements share the same tag name. Each segment is found by depth-first search within the match of the previous segment.
@@ -691,14 +751,17 @@ src/
 ├── cli.rs               # clap derive structs for all commands and subcommands
 ├── client.rs            # JenkinsClient — Basic Auth, CSRF crumb fetch & cache
 ├── browser.rs           # Firefox/Chrome cookie extraction for SSO auth
+├── manifest.rs          # rj.toml discovery, parsing, and profile resolution (extends chains)
 └── commands/
     ├── inspect.rs       # Job/parameter JSON deserialisation and display
     ├── build.rs         # Plain and parameterized POST build trigger
     ├── logs.rs          # Async progressive-text polling loop
     ├── config.rs        # XML config GET and POST
     ├── config_sweep.rs  # XML-patch loop: patch config, build, wait, save log, restore
-    ├── list_tag.rs      # Read an XML tag value across a folder or job list
+    ├── list_tag.rs      # Read an XML tag value across a folder or job list (concurrent fetches)
     ├── patch_tag.rs     # Set an XML tag value across a folder or job list
+    ├── profiles.rs      # Offline listing of manifest profiles
+    ├── run.rs           # Profile-driven build trigger (dry-run, wait, -p overrides)
     ├── sweep.rs         # Build-param loop: queue polling, build-wait, log saving
     └── list.rs          # Folder contents listing with status and building indicator
 ```
@@ -712,7 +775,9 @@ src/
 | `reqwest` | HTTP client with JSON and form support |
 | `serde` / `serde_json` | JSON deserialisation |
 | `anyhow` | Ergonomic error propagation with context chains |
+| `futures` | Bounded-concurrency streams for parallel config fetches |
 | `rusqlite` (bundled) | Read Firefox/Chrome cookie databases |
+| `toml` | Parse the `rj.toml` profile manifest |
 | `xmltree` | In-memory XML patching for `config sweep` |
 | `aes-gcm` | AES-256-GCM decryption for Chrome cookies (Windows) |
 | `cbc` / `pbkdf2` / `sha1` *(macOS)* | AES-128-CBC + key derivation for Chrome cookies (macOS) |
@@ -726,7 +791,7 @@ src/
 cargo test
 ```
 
-133 tests across all modules, covering:
+150+ tests across all modules, covering:
 
 - CLI argument parsing including shell-array-style multi-value flags (unit)
 - Basic Auth header attachment (wiremock)
@@ -744,3 +809,5 @@ cargo test
 - `config get`: single-job stdout, multi-job folder fetch, file saving with underscored filenames (wiremock + unit)
 - Folder/job validation: `--job-name` with a folder path and `--path` with a leaf job both produce clear errors (wiremock + unit)
 - Recursive folder traversal: async-recursive subfolder descent, multiple `--path` flags combined (wiremock + unit)
+- Manifest: TOML parsing, `extends` flattening and override order, cycle/missing-parent detection, scalar stringification, upward discovery (unit)
+- `run`: dry-run makes no network calls, resolved params posted as form body, CLI `-p` overrides win, `--wait` fails on non-SUCCESS (wiremock + unit)

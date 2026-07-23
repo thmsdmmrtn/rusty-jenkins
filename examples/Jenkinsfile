@@ -1,0 +1,54 @@
+// Example: consuming rusty-jenkins (rj) natively inside a Jenkins pipeline.
+//
+// The pattern that avoids a messy dependency chain:
+//
+//   1. rj is a single static binary — no runtime, no plugins, no shared
+//      libraries. Publish versioned binaries to your artifact store (Artifactory,
+//      S3, GitHub Releases) and install them onto agents through the Custom
+//      Tools plugin or a base agent image. Pin the version; never build rj
+//      from source inside the pipeline that uses it.
+//
+//   2. The job exposes ONE user-facing parameter: PROFILE. The 30+ real
+//      parameters live in rj.toml, versioned alongside the code under test,
+//      so a parameter change is a reviewed pull request, not a hand-edit of
+//      the Jenkins job UI.
+//
+//   3. Auth comes from Jenkins credentials, mapped to the JENKINS_USER /
+//      JENKINS_TOKEN environment variables rj already understands. Nothing
+//      secret ever appears in rj.toml.
+
+pipeline {
+    agent { label 'linux' }
+
+    parameters {
+        // The entire parameter surface of the wrapped tool, reduced to one choice.
+        choice(name: 'PROFILE', choices: ['smoke', 'nightly'],
+               description: 'rj profile to run — see rj.toml for what each expands to')
+    }
+
+    environment {
+        // rj reads JENKINS_URL automatically on Jenkins agents; map an API
+        // token from the credentials store for authentication.
+        JENKINS_TOKEN = credentials('rj-api-token')
+    }
+
+    stages {
+        stage('Validate manifest') {
+            steps {
+                // Resolve the profile and print the effective job + parameters
+                // without triggering anything. Fails the build early on a bad
+                // manifest edit, before any downstream job is touched.
+                sh 'rj run "${PROFILE}" --dry-run'
+            }
+        }
+
+        stage('Run') {
+            steps {
+                // --wait blocks until the downstream build finishes and exits
+                // non-zero unless it ends in SUCCESS, so this stage's result
+                // mirrors the triggered job's result.
+                sh 'rj run "${PROFILE}" --wait'
+            }
+        }
+    }
+}

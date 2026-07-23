@@ -1402,6 +1402,7 @@ dependencies = [
  "cbc",
  "clap",
  "colored",
+ "futures",
  "hmac",
  "pbkdf2",
  "reqwest",

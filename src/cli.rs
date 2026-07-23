@@ -544,6 +544,54 @@ mod tests {
         }
     }
 
+    // ── run ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn run_parses_profile_with_defaults() {
+        let cli = parse(&["run", "nightly"]);
+        match cli.command {
+            Some(Command::Run(args)) => {
+                assert_eq!(args.profile, "nightly");
+                assert!(args.params.is_empty());
+                assert!(args.job.is_none());
+                assert!(!args.dry_run);
+                assert!(!args.wait);
+                assert_eq!(args.poll_ms, 2000);
+            }
+            _ => panic!("expected Run variant"),
+        }
+    }
+
+    #[test]
+    fn run_parses_overrides_and_flags() {
+        let cli = parse(&[
+            "run", "smoke",
+            "-p", "SUITE=regression",
+            "--job", "other/job",
+            "--dry-run", "--wait",
+        ]);
+        match cli.command {
+            Some(Command::Run(args)) => {
+                assert_eq!(args.params, vec!["SUITE=regression"]);
+                assert_eq!(args.job.as_deref(), Some("other/job"));
+                assert!(args.dry_run);
+                assert!(args.wait);
+            }
+            _ => panic!("expected Run variant"),
+        }
+    }
+
+    // ── profiles ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn profiles_parses_verbose_flag() {
+        let cli = parse(&["profiles", "--verbose"]);
+        match cli.command {
+            Some(Command::Profiles(args)) => assert!(args.verbose),
+            _ => panic!("expected Profiles variant"),
+        }
+    }
+
     #[test]
     fn sweep_defaults() {
         let cli = parse(&["sweep", "my-job", "--param-name", "ENV", "--value", "x"]);

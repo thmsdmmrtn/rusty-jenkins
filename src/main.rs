@@ -45,6 +45,22 @@ async fn run() -> Result<()> {
         None => None,
     };
 
+    // Commands that never touch Jenkins run before URL/auth resolution:
+    // `rj profiles` is pure manifest inspection, and bare `rj` just prints help.
+    // Neither should fail because no Jenkins URL is configured.
+    match &cli.command {
+        Some(Command::Profiles(args)) => {
+            let m = require_manifest(manifest.as_ref(), manifest_path.as_deref())?;
+            return commands::profiles::run(m, args);
+        }
+        None if !cli.list_cookies => {
+            Cli::command().print_help()?;
+            println!();
+            return Ok(());
+        }
+        _ => {}
+    }
+
     // URL precedence: --url / JENKINS_URL first, then the manifest's [defaults].url.
     let url = cli
         .url
@@ -96,15 +112,8 @@ async fn run() -> Result<()> {
             let m = require_manifest(manifest.as_ref(), manifest_path.as_deref())?;
             commands::run::run(&client, m, args).await
         }
-        Some(Command::Profiles(args)) => {
-            let m = require_manifest(manifest.as_ref(), manifest_path.as_deref())?;
-            commands::profiles::run(m, args)
-        }
-        None => {
-            Cli::command().print_help()?;
-            println!();
-            Ok(())
-        }
+        // Handled before URL/auth resolution above; kept for match exhaustiveness.
+        Some(Command::Profiles(_)) | None => Ok(()),
     }
 }
 

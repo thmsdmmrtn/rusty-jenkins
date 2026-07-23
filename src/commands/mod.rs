@@ -140,7 +140,7 @@ fn list_folder_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn folder_resp(jobs: serde_json::Value) -> ResponseTemplate {

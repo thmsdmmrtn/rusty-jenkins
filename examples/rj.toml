@@ -1,0 +1,52 @@
+# rj.toml — profile manifest for rusty-jenkins (rj)
+#
+# Place this file at the root of your repository. `rj` discovers it by walking
+# up from the current directory (like git finding its repo root), or you can
+# point at one explicitly with --manifest / RJ_MANIFEST.
+#
+# Instead of a Jenkins job exposing 30+ string/boolean parameters in the UI —
+# or engineers memorising long `-p KEY=VALUE` incantations — the parameter
+# bundles live here, version-controlled, diffable, and reviewable. A caller
+# runs one command:
+#
+#     rj run nightly
+#
+# Validate a manifest change without triggering anything:
+#
+#     rj run nightly --dry-run
+#
+# List what's available:
+#
+#     rj profiles --verbose
+
+[defaults]
+# Fallback Jenkins base URL, used when neither --url nor JENKINS_URL is set.
+url = "https://jenkins.example.com"
+
+# A "mixin" profile holding settings shared by every test run. Profiles that
+# `extends` it inherit its job and params; anything they redeclare wins.
+[profiles.base-tests]
+job = "platform/integration-tests"
+description = "Shared settings for all integration test runs"
+
+[profiles.base-tests.params]
+REGION = "us-east-1"
+RETRIES = 3          # numbers don't need quoting — rendered as "3" for Jenkins
+VERBOSE = false      # booleans likewise — rendered as "false"
+
+[profiles.smoke]
+extends = "base-tests"
+description = "Fast pre-merge smoke suite"
+
+[profiles.smoke.params]
+SUITE = "smoke"
+RETRIES = 1          # overrides base-tests' RETRIES = 3
+
+[profiles.nightly]
+extends = "base-tests"
+description = "Full nightly regression suite"
+
+[profiles.nightly.params]
+SUITE = "full"
+PARALLELISM = 8
+UPLOAD_REPORTS = true
