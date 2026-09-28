@@ -611,7 +611,28 @@ rj tag patch --path folder \
 
 # Show existing values before the new ones for easy auditing
 rj tag patch --path folder --xml-tag branches/name --value "*/develop" --show-old
+
+# Conditional: only change <foo> where it is currently "bar" — jobs with any
+# other value (or no <foo> at all) are skipped untouched
+rj tag patch --path folder --xml-tag foo --value new-value --only-if bar
 ```
+
+**Conditional patching with `--only-if`**
+
+`--only-if` is paired by position with `--xml-tag`, just like `--value`. Give either none (unconditional patch) or exactly one per `--xml-tag`. A job is patched only when **every** condition matches the tag's current value exactly — the same text `tag list` prints. Otherwise the job is skipped and nothing is uploaded:
+
+```
+[1/3] folder/job1
+  <foo> → new-value
+[2/3] folder/job2
+  skipped — <foo> is "baz" (only-if "bar")
+[3/3] folder/job3
+  skipped — <foo> not found (only-if "bar")
+
+1 patched, 2 skipped, 0 failed
+```
+
+Conditions are checked against the same `config.xml` that gets rewritten, so there is no window for a job to change between the check and the patch.
 
 **Example output (single tag, with `--show-old`):**
 
@@ -635,7 +656,7 @@ rj tag patch --path folder --xml-tag branches/name --value "*/develop" --show-ol
   <fallbackBranch> → main
 ```
 
-Failures on individual jobs are printed and the loop continues to the remaining jobs.
+Failures on individual jobs are printed and the loop continues to the remaining jobs. A final line summarises how many jobs were patched, skipped, and failed.
 
 | Flag | Description |
 |---|---|
@@ -644,9 +665,10 @@ Failures on individual jobs are printed and the loop continues to the remaining 
 | `--job-name` | Specific job path (repeatable) |
 | `--xml-tag` | XML tag to update — supports `/`-separated paths (repeatable, paired 1-to-1 with `--value`) |
 | `--value` | Value to set — each is paired with the corresponding `--xml-tag` (repeatable) |
+| `--only-if` | Only patch when the tag currently equals this value (repeatable, paired 1-to-1 with `--xml-tag`) |
 | `--show-old` | Print the existing value before the new one |
 
-> `--xml-tag` and `--value` are paired by position. If the counts don't match, `rj` errors before making any changes.
+> `--xml-tag`, `--value`, and `--only-if` are paired by position. If the counts don't match, `rj` errors before making any changes.
 
 > Sub-folders inside `--path` are skipped by default — add `--recursive` to descend.
 

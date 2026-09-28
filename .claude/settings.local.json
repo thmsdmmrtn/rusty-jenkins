@@ -6,7 +6,19 @@
       "Bash(cargo add *)",
       "Bash(timeout 400 cargo build)",
       "Bash(timeout 400 cargo test)",
-      "Bash(timeout 400 cargo clippy --all-targets)"
+      "Bash(timeout 400 cargo clippy --all-targets)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(ssh -T git@github.com)",
+      "Bash(ssh -o BatchMode=yes -o ConnectTimeout=10 -T git@github.com)",
+      "Bash(gh auth *)",
+      "PowerShell(git config --get-all credential.helper; \"--- gh ---\"; $gh = Get-Command gh -ErrorAction SilentlyContinue; if \\($gh\\) { gh auth status } else { \"gh not installed\" }; \"--- ssh keys ---\"; Get-ChildItem \"$env:USERPROFILE\\\\.ssh\" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)",
+      "PowerShell($env:GCM_INTERACTIVE = 'never'; $env:GIT_TERMINAL_PROMPT = '0'; git ls-remote https://github.com/thmsdmmrtn/rusty-jenkins.git HEAD; \"exit: $LASTEXITCODE\")",
+      "PowerShell($env:GCM_INTERACTIVE = 'never'; $env:GIT_TERMINAL_PROMPT = '0'; git push https://github.com/thmsdmmrtn/rusty-jenkins.git main:main; \"exit: $LASTEXITCODE\")",
+      "Bash(timeout 200 cargo build)",
+      "Bash(./target/debug/rj tag *)",
+      "Bash(./target/debug/rj --url http://127.0.0.1:1 tag patch --job-name a/b --xml-tag foo --value x --xml-tag bar --value y --only-if z)",
+      "Bash(echo \"\\(exit $?\\)\")"
     ]
   }
 }

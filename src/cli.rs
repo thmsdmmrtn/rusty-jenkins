@@ -351,6 +351,14 @@ pub struct PatchTagArgs {
     #[arg(long = "value")]
     pub values: Vec<String>,
 
+    /// Only patch a job if the tag currently holds exactly this value
+    /// (repeatable, paired 1-to-1 with --xml-tag). Give none for an
+    /// unconditional patch, or one per --xml-tag. A job is changed only when
+    /// every condition matches; otherwise it is skipped untouched.
+    /// e.g. --xml-tag foo --value new --only-if bar
+    #[arg(long = "only-if", value_name = "CURRENT_VALUE")]
+    pub only_if: Vec<String>,
+
     /// Show the existing value before the new one — useful for auditing or
     /// catching accidental changes: `<tag>: old-value → new-value`
     #[arg(long, default_value_t = false)]
@@ -589,6 +597,36 @@ mod tests {
         match cli.command {
             Some(Command::Profiles(args)) => assert!(args.verbose),
             _ => panic!("expected Profiles variant"),
+        }
+    }
+
+    // ── tag patch ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tag_patch_parses_only_if_paired_with_tags() {
+        let cli = parse(&[
+            "tag", "patch", "--path", "team-a",
+            "--xml-tag", "foo", "--value", "new", "--only-if", "bar",
+            "--xml-tag", "branch", "--value", "main", "--only-if", "develop",
+        ]);
+        match cli.command {
+            Some(Command::Tag(TagArgs { action: TagAction::Patch(args) })) => {
+                assert_eq!(args.xml_tags, vec!["foo", "branch"]);
+                assert_eq!(args.values, vec!["new", "main"]);
+                assert_eq!(args.only_if, vec!["bar", "develop"]);
+            }
+            _ => panic!("expected Tag Patch variant"),
+        }
+    }
+
+    #[test]
+    fn tag_patch_only_if_defaults_to_empty() {
+        let cli = parse(&["tag", "patch", "--path", "p", "--xml-tag", "foo", "--value", "x"]);
+        match cli.command {
+            Some(Command::Tag(TagArgs { action: TagAction::Patch(args) })) => {
+                assert!(args.only_if.is_empty());
+            }
+            _ => panic!("expected Tag Patch variant"),
         }
     }
 
